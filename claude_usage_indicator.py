@@ -74,8 +74,8 @@ BAR_STYLES = {
 # Values that can be pinned next to the top-bar icon, in display order, with the
 # widest text each can take so the label keeps a fixed width.
 PANEL_METRICS = [
-    ("five_hour", "5-Hour Limit", "5h 100%"),
-    ("weekly", "Weekly Limit", "7d 100%"),
+    ("five_hour", "5-Hour Limit", "5h 99%"),
+    ("weekly", "Weekly Limit", "7d 99%"),
     ("time", "Time Until Reset", "↻ 0h00m"),
     ("tokens", "Tokens This Block", "000.0K"),
     ("cost", "Cost Today", "$000.00"),
@@ -664,10 +664,10 @@ def panel_metric(key, stats, limit):
     active, plan = stats["block_active"], stats["plan"]
     if key == "five_hour" and active:
         if has_limit(stats, limit):
-            return f"5h {pad(f'{used_pct(stats, limit)}%', 4)}"
+            return f"5h {pad(f'{used_pct(stats, limit)}%', 3)}"
         return f"5h {fmt(billable(stats['block']))}"
     if key == "weekly" and "seven_day" in plan:
-        return f"7d {pad(f'{round(plan['seven_day']['pct'])}%', 4)}"
+        return f"7d {pad(f'{round(plan['seven_day']['pct'])}%', 3)}"
     if key == "time" and active:
         return f"↻ {time_left(stats)}"
     if key == "tokens" and active:
@@ -684,8 +684,8 @@ def panel_label(stats, limit, settings):
     if not pinned:
         return "", ""
     parts = [text for text in (panel_metric(key, stats, limit) for key, _, _ in pinned) if text]
-    guide = " " + "   ".join(widest for _, _, widest in pinned)
-    return (" " + "   ".join(parts) if parts else " idle"), guide
+    guide = " " + "  ".join(widest for _, _, widest in pinned)
+    return (" " + "  ".join(parts) if parts else " idle"), guide
 
 
 STALE_AFTER = timedelta(minutes=15)  # plan data older than this gets an "as of" note
