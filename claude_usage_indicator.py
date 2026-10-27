@@ -1161,7 +1161,7 @@ def run_indicator(override):
                 and "five_hour" not in stats["plan"]):
             item("Mark Limit Reached", mark_limit_reached)
         item("Settings…", open_settings, "emblem-system-symbolic")
-        item("Quit Claude Usage", lambda _: Gtk.main_quit(), "application-exit-symbolic")
+        item("Quit", lambda _: Gtk.main_quit(), "application-exit-symbolic")
         menu.show_all()
         return menu
 
