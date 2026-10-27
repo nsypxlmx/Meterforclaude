@@ -6,15 +6,17 @@ token usage for the current 5-hour block, today, and the last 7 days.
 
 The limit per block is learned: choose "Mark Limit Reached" when Claude Code
 tells you you've hit it, and the indicator calibrates from those blocks.
-Settings live in ~/.config/claude-usage/settings.json and are edited from
-the menu.
+Settings live in ~/.config/claude-usage/settings.json and are edited in the
+Settings… window, which runs as its own GTK 4 / libadwaita process.
 
 Usage:
     claude_usage_indicator.py                 # run tray indicator
     claude_usage_indicator.py --once          # print stats to terminal
+    claude_usage_indicator.py --settings      # open the settings window
     claude_usage_indicator.py --limit 5000000 # override the limit per 5h block
 """
 import argparse
+import copy
 import functools
 import glob
 import json
@@ -69,12 +71,22 @@ BAR_STYLES = {
     "dots": ("●", "○"),
     "squares": ("■", "□"),
 }
-PANEL_STYLES = [
-    ("usage_time", "Usage and Time Left"),
-    ("usage", "Usage Only"),
-    ("time", "Time Left Only"),
-    ("icon", "Icon Only"),
+# Values that can be pinned next to the top-bar icon, in display order, with the
+# widest text each can take so the label keeps a fixed width.
+PANEL_METRICS = [
+    ("five_hour", "5-Hour Limit", "5h 100%"),
+    ("weekly", "Weekly Limit", "7d 100%"),
+    ("time", "Time Until Reset", "↻ 0h00m"),
+    ("tokens", "Tokens This Block", "000.0K"),
+    ("cost", "Cost Today", "$000.00"),
 ]
+# Older versions picked one panel style; this maps it onto pinned values.
+PANEL_MIGRATION = {"usage_time": ["five_hour", "time"], "usage": ["five_hour"],
+                   "time": ["time"], "icon": []}
+FIGURE_SPACE = " "  # as wide as a digit, so numbers don't shift the label
+# Symbolic icons are drawn like other top-bar icons and only take color near a limit.
+ICON_STYLES = [("symbolic", "Symbolic"), ("color", "Color")]
+SYMBOLIC = "#FFFFFF"
 MENU_SECTIONS = [
     ("forecast", "Forecast"),
     ("details", "Details"),
@@ -113,8 +125,9 @@ DEFAULT_SETTINGS = {
     "hits": [],             # [{"block": iso, "tokens": n}] from Mark Limit Reached
     "alerts": [75, 90],
     "reset_alert": True,
-    "accent": "system",     # "system" or a key of ACCENTS
-    "panel": "usage_time",  # a key of PANEL_STYLES
+    "icon_style": "symbolic",  # a key of ICON_STYLES
+    "accent": "system",     # "system" or a key of ACCENTS; used by the color style
+    "pinned": ["five_hour", "time"],  # keys of PANEL_METRICS shown in the top bar
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
     "animate": True,        # pulse the ring's center while Claude is writing
@@ -212,9 +225,29 @@ def write_json(path, data):
 
 
 def load_settings():
-    settings = read_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    settings["show"] = {**DEFAULT_SETTINGS["show"], **settings["show"]}
+    raw = read_json(SETTINGS_PATH, {})
+    settings = {**copy.deepcopy(DEFAULT_SETTINGS), **raw}
+    settings["show"] = {**DEFAULT_SETTINGS["show"], **raw.get("show", {})}
+    if "pinned" not in raw and "panel" in raw:
+        settings["pinned"] = list(PANEL_MIGRATION.get(raw["panel"], DEFAULT_SETTINGS["pinned"]))
+    settings.pop("panel", None)
     return settings
+
+
+def update_settings(**changes):
+    """Apply changes on top of what's on disk, so the tray and the settings
+    window (separate processes) never undo each other's edits."""
+    settings = load_settings()
+    settings.update(changes)
+    write_json(SETTINGS_PATH, settings)
+    return settings
+
+
+def settings_mtime():
+    try:
+        return os.stat(SETTINGS_PATH).st_mtime
+    except OSError:
+        return 0.0
 
 
 def system_accent():
@@ -546,12 +579,20 @@ def status_color(frac):
     return mix(COLORS["warn"], COLORS["high"], (frac - 0.75) / 0.15)
 
 
-def gauge(stats, limit, accent):
+def threshold_color(frac):
+    """Symbolic style: plain white like the rest of the top bar, amber and red only near a limit."""
+    return COLORS["high"] if frac >= 0.9 else COLORS["warn"] if frac >= 0.75 else SYMBOLIC
+
+
+def gauge(stats, limit, settings):
     """Ring spec for the panel icon: (fraction, hex color, inner ring or None).
 
     With a limit, the outer ring is usage. The inner ring is the weekly limit
-    when the plan reports it (colored once it passes half), otherwise block time,
-    so usage running ahead of the clock is visible at a glance."""
+    when the plan reports it, otherwise block time, so usage running ahead of
+    the clock is visible at a glance."""
+    symbolic = settings["icon_style"] == "symbolic"
+    accent = SYMBOLIC if symbolic else accent_color(settings)
+    paint = threshold_color if symbolic else status_color
     if not stats["block_active"]:
         return 0.0, COLORS["idle"], None
     if has_limit(stats, limit):
@@ -559,10 +600,10 @@ def gauge(stats, limit, accent):
         weekly = stats["plan"].get("seven_day")
         if weekly:
             wfrac = min(weekly["pct"] / 100, 1.0)
-            inner = (wfrac, status_color(wfrac) if wfrac >= 0.5 else accent)
+            inner = (wfrac, paint(wfrac) if symbolic or wfrac >= 0.5 else accent)
         else:
             inner = (block_elapsed(stats), accent)
-        return frac, status_color(frac), inner
+        return frac, paint(frac), inner
     return block_elapsed(stats), accent, None
 
 
@@ -613,13 +654,38 @@ def icon_path(frac, color, inner=None, pulse=None):
     return path
 
 
-def panel_label(stats, limit, style="usage_time"):
-    if style == "icon":
-        return ""
-    if not stats["block_active"]:
-        return " idle"
-    usage = f"{used_pct(stats, limit)}%" if has_limit(stats, limit) else fmt(billable(stats["block"]))
-    return " " + {"usage": usage, "time": time_left(stats)}.get(style, f"{usage} · {time_left(stats)}")
+def pad(text, width):
+    """Right-align with figure spaces so a changing value keeps its width."""
+    return FIGURE_SPACE * max(width - len(text), 0) + text
+
+
+def panel_metric(key, stats, limit):
+    """Text for one pinned top-bar value, or None when it has nothing to show."""
+    active, plan = stats["block_active"], stats["plan"]
+    if key == "five_hour" and active:
+        if has_limit(stats, limit):
+            return f"5h {pad(f'{used_pct(stats, limit)}%', 4)}"
+        return f"5h {fmt(billable(stats['block']))}"
+    if key == "weekly" and "seven_day" in plan:
+        return f"7d {pad(f'{round(plan['seven_day']['pct'])}%', 4)}"
+    if key == "time" and active:
+        return f"↻ {time_left(stats)}"
+    if key == "tokens" and active:
+        return pad(fmt(billable(stats["block"])), 6)
+    if key == "cost":
+        return money(stats["today"]["usd"])
+    return None
+
+
+def panel_label(stats, limit, settings):
+    """(label, guide) for the top bar: the pinned values, Vitals-style, and the
+    widest text they can take so the panel doesn't shift as numbers change."""
+    pinned = [m for m in PANEL_METRICS if m[0] in settings["pinned"]]
+    if not pinned:
+        return "", ""
+    parts = [text for text in (panel_metric(key, stats, limit) for key, _, _ in pinned) if text]
+    guide = " " + "   ".join(widest for _, _, widest in pinned)
+    return (" " + "   ".join(parts) if parts else " idle"), guide
 
 
 STALE_AFTER = timedelta(minutes=15)  # plan data older than this gets an "as of" note
@@ -628,7 +694,8 @@ STALE_AFTER = timedelta(minutes=15)  # plan data older than this gets an "as of"
 def menu_lines(stats, limit, settings):
     """The menu's content: {"main": rows, "submenus": [(title, rows)]}.
 
-    Rows are (text, style) with style "main" or "dim"; None is a separator.
+    Rows are (text, style) or (text, style, pin) with style "main" or "dim";
+    pin names the PANEL_METRICS value a click on the row pins. None is a separator.
     The main view keeps only what answers "how much is left?"; everything
     else sits one level down so the menu stays calm."""
     if stats["empty"]:
@@ -653,19 +720,19 @@ def menu_lines(stats, limit, settings):
         reset = f"resets {clock(stats['block_reset'])}"
         if "five_hour" in plan:
             main.append((f"{bar(budget_frac(stats, limit), bars)}  "
-                         f"{used_pct(stats, limit)}% of 5-hour limit  ·  {reset}", "main"))
+                         f"{used_pct(stats, limit)}% of 5-hour limit  ·  {reset}", "main", "five_hour"))
         elif limit:
             main.append((f"{bar(budget_frac(stats, limit), bars)}  "
-                         f"{used_pct(stats, limit)}% of {fmt(limit)} limit  ·  {reset}", "main"))
+                         f"{used_pct(stats, limit)}% of {fmt(limit)} limit  ·  {reset}", "main", "five_hour"))
         else:
             main.append((f"{bar(block_elapsed(stats), bars)}  "
-                         f"{fmt(billable(b))} tokens  ·  {reset}", "main"))
+                         f"{fmt(billable(b))} tokens  ·  {reset}", "main", "five_hour"))
     else:
         main.append(("No active block, starts with your next message", "main"))
     if "seven_day" in plan:
         weekly = plan["seven_day"]
         main.append((f"{bar(weekly['pct'] / 100, bars)}  {weekly['pct']:.0f}% of weekly limit  ·  "
-                     f"resets {weekly['reset'].astimezone():%a %H:%M}", "main"))
+                     f"resets {weekly['reset'].astimezone():%a %H:%M}", "main", "weekly"))
     forecast = projection(stats, limit) if show["forecast"] else None
     if forecast:
         main.append((forecast, "main"))
@@ -676,17 +743,17 @@ def menu_lines(stats, limit, settings):
     if show["details"] and stats["block_active"]:
         elapsed = block_elapsed(stats)
         rows = [("THIS BLOCK", "dim"),
-                (f"{fmt(billable(b))} tokens{cost(b)}", "main"),
+                (f"{fmt(billable(b))} tokens{cost(b)}", "main", "tokens"),
                 (f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  cache {fmt(b['cw'] + b['cr'])}", "dim"),
                 (f"{bar(elapsed, bars)}  {int(elapsed * 100)}% of block time passed  ·  "
-                 f"{time_left(stats)} left", "main")]
+                 f"{time_left(stats)} left", "main", "time")]
         if plan:
             rows.append((f"Plan limits from Claude Code, updated {clock(plan['updated'])}", "dim"))
         submenus.append(("Details", with_cost_note(rows)))
 
     if show["history"]:
         values = [n for _, n in stats["days"]]
-        rows = [(f"Today  {fmt(billable(stats['today']))}{cost(stats['today'])}", "main"),
+        rows = [(f"Today  {fmt(billable(stats['today']))}{cost(stats['today'])}", "main", "cost"),
                 (f"{spark(values)}  {fmt(sum(values))} in 7 days{cost(stats['week'])}", "main")]
         peak_day, peak = max(stats["days"], key=lambda d: d[1])
         if peak:
@@ -765,17 +832,28 @@ def due_alerts(stats, limit, settings, state):
     return alerts
 
 
+def current_limit(stats, settings, override=0):
+    """The plan's implied limit when real data is in, else the learned/custom fallback."""
+    if "five_hour" in stats["plan"]:
+        return plan_limit(stats)
+    return effective_limit(settings, override)
+
+
 def run_once(override):
     settings = load_settings()
     s = compute(plan=load_plan_limits())
-    limit = plan_limit(s) if "five_hour" in s["plan"] else effective_limit(settings, override)
-    print(panel_label(s, limit, settings["panel"]).strip() or "(icon only)")
+    limit = current_limit(s, settings, override)
+    print(panel_label(s, limit, settings)[0].strip() or "(icon only)")
     print()
     content = menu_lines(s, limit, settings)
 
     def show_rows(rows, indent):
         for row in rows:
-            print(indent + ("──" if row is None else ("  " if row[1] == "dim" else "") + row[0]))
+            if row is None:
+                print(indent + "──")
+                continue
+            mark = "✓ " if len(row) > 2 and row[2] in settings["pinned"] else "  "
+            print(indent + mark + ("  " if row[1] == "dim" else "") + row[0])
 
     show_rows(content["main"], "")
     for title, rows in content["submenus"]:
@@ -784,6 +862,7 @@ def run_once(override):
 
 
 def run_indicator(override):
+    import subprocess
     import gi
     gi.require_version("Gtk", "3.0")
     gi.require_version("Notify", "0.7")
@@ -805,19 +884,24 @@ def run_indicator(override):
     state = read_json(STATE_PATH, {})
     reader = LogReader()
     current = {"stats": None, "was_active": None, "shown": None,
-               "spec": None, "anim": None, "frame": 0}
+               "spec": None, "anim": None, "frame": 0, "settings_mtime": settings_mtime()}
 
     tray = None
     schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
     if schema and schema.has_key("tray-pos"):
         tray = Gio.Settings.new(TRAY_SCHEMA)
 
-    def save_settings():
-        write_json(SETTINGS_PATH, settings)
+    def apply_settings(**changes):
+        settings.clear()
+        settings.update(update_settings(**changes))
+        current["settings_mtime"] = settings_mtime()
 
     def notify(title, body, frac=1.0, color=None):
+        # A white symbolic ring would vanish on a light notification bubble.
+        if color in (None, SYMBOLIC):
+            color = accent_color(settings)
         try:
-            Notify.Notification.new(title, body, icon_path(frac, color or accent_color(settings))).show()
+            Notify.Notification.new(title, body, icon_path(frac, color)).show()
         except Exception as e:  # a missing notification daemon shouldn't stop the tray
             print("notify error:", e, file=sys.stderr)
 
@@ -826,11 +910,9 @@ def run_indicator(override):
         if not (stats and stats["block_active"]):
             return
         block_id = stats["block_start"].isoformat()
-        settings["hits"] = [h for h in settings["hits"] if h["block"] != block_id]
-        settings["hits"].append({"block": block_id, "tokens": billable(stats["block"])})
-        settings["hits"] = settings["hits"][-20:]
-        settings["limit_mode"] = "auto"
-        save_settings()
+        hits = [h for h in settings["hits"] if h["block"] != block_id]
+        hits.append({"block": block_id, "tokens": billable(stats["block"])})
+        apply_settings(hits=hits[-20:], limit_mode="auto")
         # The block is at its limit by definition; don't follow up with threshold alerts.
         state.update({"block": block_id, "block_alerted": list(settings["alerts"])})
         write_json(STATE_PATH, state)
@@ -841,75 +923,15 @@ def run_indicator(override):
                "Mark it again next time to make it more accurate.")
         refresh()
 
-    def set_limit_mode(mode):
-        settings["limit_mode"] = mode
-        save_settings()
+    def toggle_pin(mi, key):
+        pinned = [k for k, _, _ in PANEL_METRICS
+                  if (k in settings["pinned"] and k != key) or (k == key and mi.get_active())]
+        apply_settings(pinned=pinned)
         refresh()
 
-    def forget_learned(_):
-        settings["hits"] = []
-        save_settings()
-        refresh()
-
-    def set_custom_limit(_):
-        dialog = Gtk.Dialog(title="Set Custom Limit", modal=True)
-        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
-                           "Set Limit", Gtk.ResponseType.OK)
-        dialog.set_default_response(Gtk.ResponseType.OK)
-        box = dialog.get_content_area()
-        box.set_spacing(8)
-        box.set_border_width(16)
-        box.add(Gtk.Label(label="Tokens per 5-hour block", xalign=0))
-        entry = Gtk.Entry(activates_default=True, placeholder_text="e.g. 5M or 500K")
-        if settings["custom_limit"]:
-            entry.set_text(fmt(settings["custom_limit"]))
-        box.add(entry)
-        hint = Gtk.Label(xalign=0)
-        box.add(hint)
-        dialog.show_all()
-        while dialog.run() == Gtk.ResponseType.OK:
-            n = parse_tokens(entry.get_text())
-            if n:
-                settings["custom_limit"] = n
-                settings["limit_mode"] = "custom"
-                save_settings()
-                break
-            hint.set_markup("<small>Enter a number like 5M, 500K or 5000000.</small>")
-        dialog.destroy()
-        refresh()
-
-    def set_alerts(levels):
-        settings["alerts"] = levels
-        save_settings()
-        refresh()
-
-    def toggle_reset_alert(mi):
-        settings["reset_alert"] = mi.get_active()
-        save_settings()
-
-    def set_setting(key, value):
-        settings[key] = value
-        save_settings()
-        refresh()
-
-    def toggle_section(mi, key):
-        settings["show"][key] = mi.get_active()
-        save_settings()
-        refresh()
-
-    def header(menu, text):
-        mi = Gtk.MenuItem(label=text)
-        mi.set_sensitive(False)
-        menu.append(mi)
-
-    def set_tray_position(pos):
-        tray.set_string("tray-pos", pos)
-        refresh(force=True)
-
-    def toggle_animate(mi):
-        settings["animate"] = mi.get_active()
-        save_settings()
-        watch_activity()
+    def open_settings(_):
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--settings"],
+                         start_new_session=True)
 
     def current_icon():
         if current["anim"]:
@@ -921,8 +943,15 @@ def run_indicator(override):
         ind.set_icon_full(current_icon(), "Claude usage")
         return True
 
-    def watch_activity():
-        """Start the pulse while a log was written moments ago; stop it after."""
+    def watch():
+        """Every 2s: pick up edits from the settings window, and pulse the
+        icon while a log was written moments ago."""
+        mtime = settings_mtime()
+        if mtime != current["settings_mtime"]:
+            current["settings_mtime"] = mtime
+            settings.clear()
+            settings.update(load_settings())
+            refresh()
         working = (settings["animate"] and current["spec"] is not None
                    and time.time() - reader.latest_write() < ACTIVE_SECONDS)
         if working and not current["anim"]:
@@ -934,128 +963,32 @@ def run_indicator(override):
             ind.set_icon_full(current_icon(), "Claude usage")
         return True
 
-    def radio_group(menu, choices):
-        """choices: [(label, active, callback)]; callbacks fire only on user selection."""
-        group = None
-        for label, active, cb in choices:
-            mi = Gtk.RadioMenuItem(label=label, group=group)
-            group = group or mi
-            mi.set_active(active)
-            mi.connect("toggled", lambda w, cb=cb: w.get_active() and cb())
-            menu.append(mi)
-
-    def build_limit_menu():
-        sub = Gtk.Menu()
-        learned = learned_limit(settings)
-        if current["stats"] and "five_hour" in current["stats"]["plan"]:
-            header(sub, "Using your plan's real limits")
-            sub.append(Gtk.SeparatorMenuItem())
-            header(sub, "WHEN PLAN DATA IS UNAVAILABLE")
-        if override:
-            mi = Gtk.MenuItem(label=f"Set by --limit to {fmt(override)}")
-            mi.set_sensitive(False)
-            sub.append(mi)
-            return sub
-        radio_group(sub, [
-            (f"Automatic — {fmt(learned)}" if learned else "Automatic — not learned yet",
-             settings["limit_mode"] == "auto", lambda: set_limit_mode("auto")),
-            *([(f"Custom — {fmt(settings['custom_limit'])}",
-                settings["limit_mode"] == "custom", lambda: set_limit_mode("custom"))]
-              if settings["custom_limit"] else []),
-            ("None", settings["limit_mode"] == "none", lambda: set_limit_mode("none")),
-        ])
-        sub.append(Gtk.SeparatorMenuItem())
-        mi = Gtk.MenuItem(label="Set Custom Limit…")
-        mi.connect("activate", set_custom_limit)
-        sub.append(mi)
-        if settings["hits"]:
-            mi = Gtk.MenuItem(label="Forget Learned Limit")
-            mi.connect("activate", forget_learned)
-            sub.append(mi)
-        return sub
-
-    def build_alerts_menu():
-        sub = Gtk.Menu()
-        radio_group(sub, [
-            (alert_label(levels), settings["alerts"] == levels, lambda lv=levels: set_alerts(lv))
-            for levels in ALERT_CHOICES
-        ])
-        sub.append(Gtk.SeparatorMenuItem())
-        mi = Gtk.CheckMenuItem(label="When Block Resets")
-        mi.set_active(settings["reset_alert"])
-        mi.connect("toggled", toggle_reset_alert)
-        sub.append(mi)
-        return sub
-
-    def build_appearance_menu():
-        sub = Gtk.Menu()
-        header(sub, "ACCENT COLOR")
-        system = system_accent()
-        accents = [("system", f"Match System ({ACCENTS[system][0]})" if system in ACCENTS
-                    else "Match System")]
-        accents += [(key, name) for key, (name, _) in ACCENTS.items()]
-        radio_group(sub, [(label, settings["accent"] == key, lambda k=key: set_setting("accent", k))
-                          for key, label in accents])
-        sub.append(Gtk.SeparatorMenuItem())
-        header(sub, "PANEL SHOWS")
-        radio_group(sub, [(label, settings["panel"] == key, lambda k=key: set_setting("panel", k))
-                          for key, label in PANEL_STYLES])
-        sub.append(Gtk.SeparatorMenuItem())
-        header(sub, "BAR STYLE")
-        radio_group(sub, [(f"{full * 3}{blank * 2}  {key.capitalize()}", settings["bars"] == key,
-                           lambda k=key: set_setting("bars", k))
-                          for key, (full, blank) in BAR_STYLES.items()])
-        sub.append(Gtk.SeparatorMenuItem())
-        mi = Gtk.CheckMenuItem(label="Animate While Claude Is Working")
-        mi.set_active(settings["animate"])
-        mi.connect("toggled", toggle_animate)
-        sub.append(mi)
-        if tray:
-            sub.append(Gtk.SeparatorMenuItem())
-            header(sub, "POSITION IN TOP BAR")
-            pos = tray.get_string("tray-pos")
-            radio_group(sub, [(label, pos == key, lambda k=key: set_tray_position(k))
-                              for key, label in TRAY_POSITIONS])
-            header(sub, "Moves all tray icons together")
-        return sub
-
-    def build_customize_menu():
-        sub = Gtk.Menu()
-        header(sub, "SHOW IN MENU")
-        for key, label in MENU_SECTIONS:
-            mi = Gtk.CheckMenuItem(label=label)
-            mi.set_active(settings["show"][key])
-            mi.connect("toggled", toggle_section, key)
-            sub.append(mi)
-        for kind in ("projects", "models"):
-            sub.append(Gtk.SeparatorMenuItem())
-            header(sub, f"{kind.upper()} COVER")
-            radio_group(sub, [(label, settings[f"{kind}_scope"] == key,
-                               lambda k=key, kind=kind: set_setting(f"{kind}_scope", k))
-                              for key, label in SCOPES])
-        return sub
-
     def build_menu(stats, limit):
         menu = Gtk.Menu()
-
-        def item(text, cb=None, dim=False):
-            mi = Gtk.MenuItem(label=text)
-            if cb:
-                mi.connect("activate", cb)
-            # Tray menus can't be styled, so dimming (insensitive) is the only
-            # way to rank rows; the main numbers stay bright.
-            mi.set_sensitive(not dim)
-            menu.append(mi)
-            return mi
 
         def fill(target, rows):
             for row in rows:
                 if row is None:
                     target.append(Gtk.SeparatorMenuItem())
                     continue
-                mi = Gtk.MenuItem(label=row[0])
-                mi.set_sensitive(row[1] != "dim")
+                if len(row) > 2:
+                    # Like Vitals: click a value to pin it to the top bar.
+                    mi = Gtk.CheckMenuItem(label=row[0])
+                    mi.set_active(row[2] in settings["pinned"])
+                    mi.connect("toggled", toggle_pin, row[2])
+                else:
+                    mi = Gtk.MenuItem(label=row[0])
+                    # Tray menus can't be styled, so dimming (insensitive) is the
+                    # only way to rank rows; the main numbers stay bright.
+                    mi.set_sensitive(row[1] != "dim")
                 target.append(mi)
+
+        def item(text, cb=None):
+            mi = Gtk.MenuItem(label=text)
+            if cb:
+                mi.connect("activate", cb)
+            menu.append(mi)
+            return mi
 
         content = menu_lines(stats, limit, settings)
         fill(menu, content["main"])
@@ -1069,34 +1002,17 @@ def run_indicator(override):
         if (stats["block_active"] and billable(stats["block"]) and not override
                 and "five_hour" not in stats["plan"]):
             item("Mark Limit Reached", mark_limit_reached)
-        item("Settings").set_submenu(build_settings_menu())
+        item("Settings…", open_settings)
         item("Quit Claude Usage", lambda _: Gtk.main_quit())
         menu.show_all()
         return menu
-
-    def build_settings_menu():
-        sub = Gtk.Menu()
-        for title, build in (("Limit", build_limit_menu), ("Alerts", build_alerts_menu),
-                             ("Appearance", build_appearance_menu),
-                             ("Customize Menu", build_customize_menu)):
-            mi = Gtk.MenuItem(label=title)
-            mi.set_submenu(build())
-            sub.append(mi)
-        sub.append(Gtk.SeparatorMenuItem())
-        mi = Gtk.MenuItem(label="Refresh Now")
-        mi.connect("activate", lambda _: refresh(force=True))
-        sub.append(mi)
-        return sub
 
     def refresh(force=False):
         try:
             stats = compute(reader, load_plan_limits())
             current["stats"] = stats
-            if "five_hour" in stats["plan"]:
-                limit = plan_limit(stats)
-            else:
-                limit = effective_limit(settings, override)
-            frac, color, inner = gauge(stats, limit, accent_color(settings))
+            limit = current_limit(stats, settings, override)
+            frac, color, inner = gauge(stats, limit, settings)
             current["spec"] = (frac, color, inner)
 
             alerts = due_alerts(stats, limit, settings, state)
@@ -1111,15 +1027,15 @@ def run_indicator(override):
 
             # Only touch the panel when something visible changed: replacing the
             # menu closes it if it's open, and refreshes are frequent.
-            icon, label = icon_path(frac, color, inner), panel_label(stats, limit, settings["panel"])
+            icon = icon_path(frac, color, inner)
+            label, guide = panel_label(stats, limit, settings)
             shown = (icon, label, repr(menu_lines(stats, limit, settings)),
                      json.dumps(settings, sort_keys=True), system_accent(),
-                     tray.get_string("tray-pos") if tray else None,
                      stats["block_active"] and billable(stats["block"]) > 0)
             if force or shown != current["shown"]:
                 current["shown"] = shown
                 ind.set_icon_full(current_icon(), "Claude usage")
-                ind.set_label(label, "00000000000")
+                ind.set_label(label, guide)
                 ind.set_menu(build_menu(stats, limit))
         except Exception as e:  # keep the tray alive on parse errors
             ind.set_label(" err", "")
@@ -1133,17 +1049,208 @@ def run_indicator(override):
 
     refresh()
     GLib.timeout_add_seconds(REFRESH_SECONDS, refresh)
-    GLib.timeout_add_seconds(2, watch_activity)
+    GLib.timeout_add_seconds(2, watch)
     Gtk.main()
+
+
+def run_settings():
+    """The Settings… window: GTK 4 + libadwaita, in its own process because the
+    tray runs on GTK 3. Every change is written straight to settings.json; the
+    tray notices within two seconds."""
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, Gtk
+
+    tray = None
+    schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
+    if schema and schema.has_key("tray-pos"):
+        tray = Gio.Settings.new(TRAY_SCHEMA)
+
+    def switch_row(title, active, on_change, subtitle=None):
+        row = Adw.SwitchRow(title=title, active=active)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.connect("notify::active", lambda r, _: on_change(r.get_active()))
+        return row
+
+    def combo_row(title, options, selected, on_change, subtitle=None):
+        keys = [key for key, _ in options]
+        row = Adw.ComboRow(title=title, model=Gtk.StringList.new([label for _, label in options]))
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.set_selected(keys.index(selected) if selected in keys else 0)
+        row.connect("notify::selected", lambda r, _: on_change(keys[r.get_selected()]))
+        return row
+
+    def group(title, rows, description=None):
+        g = Adw.PreferencesGroup(title=title)
+        if description:
+            g.set_description(description)
+        for row in rows:
+            g.add(row)
+        return g
+
+    def page(groups):
+        p = Adw.PreferencesPage()
+        for g in groups:
+            p.add(g)
+        return p
+
+    def set_pinned(key, on):
+        pinned = load_settings()["pinned"]
+        update_settings(pinned=[k for k, _, _ in PANEL_METRICS
+                                if (k in pinned and k != key) or (k == key and on)])
+
+    def set_shown(key, on):
+        show = load_settings()["show"]
+        show[key] = on
+        update_settings(show=show)
+
+    def build(app):
+        s = load_settings()
+        toasts = Adw.ToastOverlay()
+
+        # Top Bar: what sits next to the icon, and how the icon looks.
+        accent_options = [("system", f"Match System ({ACCENTS[system_accent()][0]})"
+                           if system_accent() in ACCENTS else "Match System")]
+        accent_options += [(key, name) for key, (name, _) in ACCENTS.items()]
+        accent_row = combo_row("Accent Color", accent_options, s["accent"],
+                               lambda k: update_settings(accent=k))
+        accent_row.set_sensitive(s["icon_style"] == "color")
+
+        def set_style(key):
+            update_settings(icon_style=key)
+            accent_row.set_sensitive(key == "color")
+
+        top_groups = [
+            group("Pinned Values",
+                  [switch_row(label, key in s["pinned"], lambda on, k=key: set_pinned(k, on))
+                   for key, label, _ in PANEL_METRICS],
+                  "Shown next to the icon. You can also click a value in the menu to pin it."),
+            group("Icon", [
+                combo_row("Style", ICON_STYLES, s["icon_style"], set_style,
+                          "Symbolic matches the other top-bar icons and turns amber and red near a limit"),
+                accent_row,
+                switch_row("Animate While Claude Is Working", s["animate"],
+                           lambda on: update_settings(animate=on)),
+            ]),
+        ]
+        if tray:
+            top_groups.append(group("Position", [
+                combo_row("Position in Top Bar", TRAY_POSITIONS, tray.get_string("tray-pos"),
+                          lambda k: tray.set_string("tray-pos", k),
+                          "Applies to all tray icons"),
+            ]))
+
+        # Menu: which sections appear and how they read.
+        menu_groups = [
+            group("Sections", [switch_row(label, s["show"][key], lambda on, k=key: set_shown(k, on))
+                               for key, label in MENU_SECTIONS]),
+            group("Breakdowns", [
+                combo_row("Projects Cover", SCOPES, s["projects_scope"],
+                          lambda k: update_settings(projects_scope=k)),
+                combo_row("Models Cover", SCOPES, s["models_scope"],
+                          lambda k: update_settings(models_scope=k)),
+            ]),
+            group("Style", [
+                combo_row("Progress Bars",
+                          [(key, f"{full * 3}{blank * 2}  {key.capitalize()}")
+                           for key, (full, blank) in BAR_STYLES.items()],
+                          s["bars"], lambda k: update_settings(bars=k)),
+            ]),
+        ]
+
+        # Limits & Alerts.
+        plan = load_plan_limits()
+        if "five_hour" in plan:
+            live = f"Live from Claude Code: {plan['five_hour']['pct']:.0f}% of 5-hour"
+            if "seven_day" in plan:
+                live += f", {plan['seven_day']['pct']:.0f}% of weekly"
+        else:
+            live = "Not available right now. Start a Claude Code session to load them"
+        plan_row = Adw.ActionRow(title="Plan Limits", subtitle=live)
+
+        learned = learned_limit(s)
+        custom = s["custom_limit"]
+        fallback_options = [
+            ("auto", f"Automatic ({fmt(learned)} learned)" if learned else "Automatic (not learned yet)"),
+            ("custom", f"Custom ({fmt(custom)})" if custom else "Custom (not set)"),
+            ("none", "None"),
+        ]
+        fallback_row = combo_row("When Plan Data Is Unavailable", fallback_options, s["limit_mode"],
+                                 lambda k: update_settings(limit_mode=k))
+
+        custom_row = Adw.EntryRow(title="Custom Limit per 5-Hour Block", show_apply_button=True)
+        if custom:
+            custom_row.set_text(fmt(custom))
+
+        def apply_custom(row):
+            n = parse_tokens(row.get_text())
+            if n:
+                update_settings(custom_limit=n, limit_mode="custom")
+                toasts.add_toast(Adw.Toast(title=f"Custom limit set to {fmt(n)} tokens"))
+            else:
+                toasts.add_toast(Adw.Toast(title="Enter a number like 5M, 500K or 5000000"))
+
+        custom_row.connect("apply", apply_custom)
+
+        forget_row = Adw.ButtonRow(title="Forget Learned Limit")
+        forget_row.set_sensitive(bool(s["hits"]))
+
+        def forget(row):
+            update_settings(hits=[])
+            row.set_sensitive(False)
+            toasts.add_toast(Adw.Toast(title="Learned limit forgotten"))
+
+        forget_row.connect("activated", forget)
+
+        alert_options = [(",".join(map(str, levels)), alert_label(levels)) for levels in ALERT_CHOICES]
+        limit_groups = [
+            group("Limits", [plan_row, fallback_row, custom_row, forget_row],
+                  "Your plan's real limits are used whenever Claude Code reports them."),
+            group("Alerts", [
+                combo_row("Usage Alerts", alert_options, ",".join(map(str, s["alerts"])),
+                          lambda k: update_settings(alerts=[int(x) for x in k.split(",") if x]),
+                          "For both the 5-hour and the weekly limit"),
+                switch_row("When Block Resets", s["reset_alert"],
+                           lambda on: update_settings(reset_alert=on)),
+            ]),
+        ]
+
+        stack = Adw.ViewStack()
+        stack.add_titled_with_icon(page(top_groups), "top-bar", "Top Bar",
+                                   "preferences-desktop-appearance-symbolic")
+        stack.add_titled_with_icon(page(menu_groups), "menu", "Menu", "open-menu-symbolic")
+        stack.add_titled_with_icon(page(limit_groups), "limits", "Limits & Alerts",
+                                   "preferences-system-notifications-symbolic")
+        header = Adw.HeaderBar(title_widget=Adw.ViewSwitcher(
+            stack=stack, policy=Adw.ViewSwitcherPolicy.WIDE))
+        toolbar = Adw.ToolbarView(content=stack)
+        toolbar.add_top_bar(header)
+        toasts.set_child(toolbar)
+
+        window = Adw.ApplicationWindow(application=app, title="Claude Usage Settings",
+                                       default_width=560, default_height=680, content=toasts)
+        window.present()
+
+    app = Adw.Application(application_id="io.github.ClaudeUsage.Settings")
+    # A second launch focuses the open window instead of opening another.
+    app.connect("activate", lambda a: a.get_active_window().present()
+                if a.get_active_window() else build(a))
+    app.run(None)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="print stats and exit")
+    ap.add_argument("--settings", action="store_true", help="open the settings window")
     ap.add_argument("--limit", type=int, default=0,
                     help="token limit per 5h block; overrides the menu setting")
     args = ap.parse_args()
-    if args.once:
+    if args.settings:
+        run_settings()
+    elif args.once:
         run_once(args.limit)
     else:
         run_indicator(args.limit)
