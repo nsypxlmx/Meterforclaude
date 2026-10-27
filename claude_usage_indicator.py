@@ -664,10 +664,10 @@ def panel_metric(key, stats, limit):
     active, plan = stats["block_active"], stats["plan"]
     if key == "five_hour" and active:
         if has_limit(stats, limit):
-            return f"5h{pad(f'{used_pct(stats, limit)}%', 3)}"
+            return f"5h{used_pct(stats, limit)}%"
         return f"5h{fmt(billable(stats['block']))}"
     if key == "weekly" and "seven_day" in plan:
-        return f"7d{pad(f'{round(plan['seven_day']['pct'])}%', 3)}"
+        return f"7d{round(plan['seven_day']['pct'])}%"
     if key == "time" and active:
         return f"↻{time_left(stats)}"
     if key == "tokens" and active:
