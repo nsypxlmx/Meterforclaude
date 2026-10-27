@@ -38,13 +38,47 @@ HISTORY_DAYS = 8
 RATE_WINDOW = timedelta(minutes=30)
 LEARN_FROM = 5  # most recent marked blocks used for the learned limit
 SPARK = "▁▂▃▄▅▆▇█"
+# Status colors carry meaning, so they stay fixed whatever the accent is.
 COLORS = {
     "idle": "#8a8a8a",
-    "brand": "#D97757",
     "ok": "#5BB974",
     "warn": "#F2B33D",
     "high": "#E5534B",
 }
+# Ring color when no limit is set. GNOME names match org.gnome.desktop.interface accent-color.
+ACCENTS = {
+    "claude": ("Claude", "#D97757"),
+    "blue": ("Blue", "#3584E4"),
+    "teal": ("Teal", "#2190A4"),
+    "green": ("Green", "#3A944A"),
+    "yellow": ("Yellow", "#C88800"),
+    "orange": ("Orange", "#ED5B00"),
+    "red": ("Red", "#E62D42"),
+    "pink": ("Pink", "#D56199"),
+    "purple": ("Purple", "#9141AC"),
+    "slate": ("Slate", "#6F8396"),
+    "brown": ("Brown", "#865E3C"),
+}
+BAR_STYLES = {
+    "pills": ("▰", "▱"),
+    "blocks": ("█", "░"),
+    "dots": ("●", "○"),
+    "squares": ("■", "□"),
+}
+PANEL_STYLES = [
+    ("usage_time", "Usage and Time Left"),
+    ("usage", "Usage Only"),
+    ("time", "Time Left Only"),
+    ("icon", "Icon Only"),
+]
+MENU_SECTIONS = [
+    ("details", "Block Details"),
+    ("forecast", "Forecast"),
+    ("history", "Today & Last 7 Days"),
+    ("cost", "Cost Estimates"),
+    ("projects", "Projects"),
+    ("models", "Models"),
+]
 # Anthropic API list prices, $ per million tokens: (input, output, cache read).
 # Cache writes bill at 1.25x input (5-minute TTL) or 2x input (1-hour TTL).
 # Source: Claude API model table, October 2026.
@@ -73,6 +107,10 @@ DEFAULT_SETTINGS = {
     "hits": [],             # [{"block": iso, "tokens": n}] from Mark Limit Reached
     "alerts": [75, 90],
     "reset_alert": True,
+    "accent": "system",     # "system" or a key of ACCENTS
+    "panel": "usage_time",  # a key of PANEL_STYLES
+    "bars": "pills",        # a key of BAR_STYLES
+    "show": {key: True for key, _ in MENU_SECTIONS},
 }
 
 
@@ -150,7 +188,28 @@ def write_json(path, data):
 
 
 def load_settings():
-    return read_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    settings = read_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    settings["show"] = {**DEFAULT_SETTINGS["show"], **settings["show"]}
+    return settings
+
+
+def system_accent():
+    """GNOME's accent color name, or None where the desktop doesn't have one."""
+    try:
+        from gi.repository import Gio
+        schema = Gio.SettingsSchemaSource.get_default().lookup("org.gnome.desktop.interface", True)
+        if schema and schema.has_key("accent-color"):
+            return Gio.Settings.new("org.gnome.desktop.interface").get_string("accent-color")
+    except Exception:
+        pass
+    return None
+
+
+def accent_color(settings):
+    name = settings["accent"]
+    if name == "system":
+        name = system_accent()
+    return ACCENTS.get(name, ACCENTS["claude"])[1]
 
 
 def learned_limit(settings):
@@ -326,9 +385,10 @@ def model_name(model):
     return f"{family.capitalize()} {major}" + (f".{minor}" if minor else "")
 
 
-def bar(frac, width=12):
+def bar(frac, style="pills", width=12):
+    full, blank = BAR_STYLES.get(style, BAR_STYLES["pills"])
     filled = round(min(max(frac, 0), 1) * width)
-    return "▰" * filled + "▱" * (width - filled)
+    return full * filled + blank * (width - filled)
 
 
 def spark(values):
@@ -385,95 +445,106 @@ def projection(stats, limit):
     return f"At this pace, about {fmt(used + rate * left)} by {clock(stats['block_reset'])}"
 
 
-def gauge(stats, limit):
-    """(fraction, color key) for the panel ring: limit used, or block time elapsed."""
+def gauge(stats, limit, accent):
+    """(fraction, hex color) for the panel ring: limit used, or block time elapsed."""
     if not stats["block_active"]:
-        return 0.0, "idle"
+        return 0.0, COLORS["idle"]
     if limit:
         frac = budget_frac(stats, limit)
-        return frac, "ok" if frac < 0.6 else "warn" if frac < 0.85 else "high"
-    return block_elapsed(stats), "brand"
+        return frac, COLORS["ok" if frac < 0.6 else "warn" if frac < 0.85 else "high"]
+    return block_elapsed(stats), accent
 
 
 def icon_path(frac, color):
     """Write (once) and return an SVG ring gauge; 2% steps keep the cache small."""
     step = int(frac * 50) * 2
-    path = os.path.join(ICON_DIR, f"gauge-{color}-{step}.svg")
+    path = os.path.join(ICON_DIR, f"gauge-{color.lstrip('#').lower()}-{step}.svg")
     if os.path.exists(path):
         return path
     r = 22
     circ = 2 * math.pi * r
     arc = ""
     if step:
-        arc = (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="{COLORS[color]}" '
+        arc = (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="{color}" '
                f'stroke-width="9" stroke-linecap="round" '
                f'stroke-dasharray="{circ * step / 100:.2f} {circ:.2f}" transform="rotate(-90 32 32)"/>')
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
            f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="9"/>'
-           f'{arc}<circle cx="32" cy="32" r="7" fill="{COLORS[color]}"/></svg>')
+           f'{arc}<circle cx="32" cy="32" r="7" fill="{color}"/></svg>')
     os.makedirs(ICON_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(svg)
     return path
 
 
-def panel_label(stats, limit):
+def panel_label(stats, limit, style="usage_time"):
+    if style == "icon":
+        return ""
     if not stats["block_active"]:
         return " idle"
-    lead = f"{used_pct(stats, limit)}%" if limit else fmt(billable(stats["block"]))
-    return f" {lead} · {time_left(stats)}"
+    usage = f"{used_pct(stats, limit)}%" if limit else fmt(billable(stats["block"]))
+    return " " + {"usage": usage, "time": time_left(stats)}.get(style, f"{usage} · {time_left(stats)}")
 
 
 def menu_lines(stats, limit, settings):
     """Menu rows as (text, style) where style is "main" or "dim"; None is a separator."""
     if stats["empty"]:
         return [("No Claude Code logs found", "dim")]
+    show, bars = settings["show"], settings["bars"]
+
+    def cost(tk):
+        return f"  ·  ≈ {money(tk['usd'])}" if show["cost"] else ""
+
     lines = [("CURRENT 5H BLOCK", "dim")]
     if stats["block_active"]:
         b = stats["block"]
         lines.append((f"{fmt(billable(b))} tokens  ·  resets {clock(stats['block_reset'])} "
                       f"(in {time_left(stats)})", "main"))
         if limit:
-            lines.append((f"{bar(budget_frac(stats, limit))}  "
+            lines.append((f"{bar(budget_frac(stats, limit), bars)}  "
                           f"{used_pct(stats, limit)}% of {fmt(limit)} limit", "main"))
         elapsed = block_elapsed(stats)
-        lines.append((f"{bar(elapsed)}  {int(elapsed * 100)}% of block time passed", "main"))
-        forecast = projection(stats, limit)
+        lines.append((f"{bar(elapsed, bars)}  {int(elapsed * 100)}% of block time passed", "main"))
+        forecast = projection(stats, limit) if show["forecast"] else None
         if forecast:
             lines.append((forecast, "main"))
-        lines.append((f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  "
-                      f"cache {fmt(b['cw'] + b['cr'])}  ·  ≈ {money(b['usd'])}", "dim"))
+        if show["details"]:
+            lines.append((f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  "
+                          f"cache {fmt(b['cw'] + b['cr'])}{cost(b)}", "dim"))
         if not limit and settings["limit_mode"] == "auto":
             lines.append(("Hit your limit? Choose Mark Limit Reached to calibrate", "dim"))
     else:
         lines.append(("No active block, starts with your next message", "main"))
 
-    lines += [None, ("TODAY & LAST 7 DAYS", "dim")]
-    lines.append((f"Today  {fmt(billable(stats['today']))}  ·  ≈ {money(stats['today']['usd'])}", "main"))
-    values = [n for _, n in stats["days"]]
-    lines.append((f"{spark(values)}  {fmt(sum(values))} in 7 days  ·  "
-                  f"≈ {money(stats['week']['usd'])}", "main"))
-    peak_day, peak = max(stats["days"], key=lambda d: d[1])
-    if peak:
-        lines.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
-                      f"cache reads {fmt(stats['week']['cr'])}", "dim"))
-    note = "≈ is what this usage would cost at API list prices"
-    if stats["week"]["unpriced"]:
-        note += f"; {fmt(stats['week']['unpriced'])} tokens on unpriced models not included"
-    lines.append((note, "dim"))
+    if show["history"]:
+        lines += [None, ("TODAY & LAST 7 DAYS", "dim")]
+        lines.append((f"Today  {fmt(billable(stats['today']))}{cost(stats['today'])}", "main"))
+        values = [n for _, n in stats["days"]]
+        lines.append((f"{spark(values)}  {fmt(sum(values))} in 7 days{cost(stats['week'])}", "main"))
+        peak_day, peak = max(stats["days"], key=lambda d: d[1])
+        if peak:
+            lines.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
+                          f"cache reads {fmt(stats['week']['cr'])}", "dim"))
 
     active = {p: tk for p, tk in stats["projects"].items() if billable(tk)}
-    if active:
+    if show["projects"] and active:
         lines += [None, ("TODAY BY PROJECT", "dim")]
         ranked = sorted(active.items(), key=lambda x: -billable(x[1]))
         for name, tk in ranked[:5]:
-            lines.append((f"{name}  {fmt(billable(tk))}  ·  ≈ {money(tk['usd'])}", "main"))
+            lines.append((f"{name}  {fmt(billable(tk))}{cost(tk)}", "main"))
         if len(ranked) > 5:
-            rest = ranked[5:]
-            lines.append((f"{len(rest)} more  {fmt(sum(billable(tk) for _, tk in rest))}  ·  "
-                          f"≈ {money(sum(tk['usd'] for _, tk in rest))}", "dim"))
+            rest = empty()
+            for _, tk in ranked[5:]:
+                add(rest, tk)
+            lines.append((f"{len(ranked) - 5} more  {fmt(billable(rest))}{cost(rest)}", "dim"))
 
-    if stats["models"]:
+    if show["cost"] and any(line and "≈" in line[0] for line in lines):
+        note = "≈ is what this usage would cost at API list prices"
+        if stats["week"]["unpriced"]:
+            note += f"; {fmt(stats['week']['unpriced'])} tokens on unpriced models not included"
+        lines.append((note, "dim"))
+
+    if show["models"] and stats["models"]:
         lines += [None, ("BLOCK BY MODEL", "dim")]
         block_total = sum(stats["models"].values()) or 1
         for m, n in sorted(stats["models"].items(), key=lambda x: -x[1]):
@@ -511,7 +582,7 @@ def run_once(override):
     settings = load_settings()
     limit = effective_limit(settings, override)
     s = compute()
-    print(panel_label(s, limit).strip())
+    print(panel_label(s, limit, settings["panel"]).strip() or "(icon only)")
     print()
     for line in menu_lines(s, limit, settings):
         print("  ──" if line is None else ("  " if line[1] == "dim" else "") + line[0])
@@ -527,7 +598,7 @@ def run_indicator(override):
     except (ValueError, ImportError):
         gi.require_version("AppIndicator3", "0.1")
         from gi.repository import AppIndicator3 as AppIndicator
-    from gi.repository import Gtk, GLib, Notify
+    from gi.repository import Gtk, GLib, Gio, Notify
 
     Notify.init("Claude Usage")
     ind = AppIndicator.Indicator.new(
@@ -543,9 +614,9 @@ def run_indicator(override):
     def save_settings():
         write_json(SETTINGS_PATH, settings)
 
-    def notify(title, body, frac=1.0, color="brand"):
+    def notify(title, body, frac=1.0, color=None):
         try:
-            Notify.Notification.new(title, body, icon_path(frac, color)).show()
+            Notify.Notification.new(title, body, icon_path(frac, color or accent_color(settings))).show()
         except Exception as e:  # a missing notification daemon shouldn't stop the tray
             print("notify error:", e, file=sys.stderr)
 
@@ -615,6 +686,21 @@ def run_indicator(override):
         settings["reset_alert"] = mi.get_active()
         save_settings()
 
+    def set_setting(key, value):
+        settings[key] = value
+        save_settings()
+        refresh()
+
+    def toggle_section(mi, key):
+        settings["show"][key] = mi.get_active()
+        save_settings()
+        refresh()
+
+    def header(menu, text):
+        mi = Gtk.MenuItem(label=text)
+        mi.set_sensitive(False)
+        menu.append(mi)
+
     def radio_group(menu, choices):
         """choices: [(label, active, callback)]; callbacks fire only on user selection."""
         group = None
@@ -664,6 +750,36 @@ def run_indicator(override):
         sub.append(mi)
         return sub
 
+    def build_appearance_menu():
+        sub = Gtk.Menu()
+        header(sub, "ACCENT COLOR")
+        system = system_accent()
+        accents = [("system", f"Match System ({ACCENTS[system][0]})" if system in ACCENTS
+                    else "Match System")]
+        accents += [(key, name) for key, (name, _) in ACCENTS.items()]
+        radio_group(sub, [(label, settings["accent"] == key, lambda k=key: set_setting("accent", k))
+                          for key, label in accents])
+        sub.append(Gtk.SeparatorMenuItem())
+        header(sub, "PANEL SHOWS")
+        radio_group(sub, [(label, settings["panel"] == key, lambda k=key: set_setting("panel", k))
+                          for key, label in PANEL_STYLES])
+        sub.append(Gtk.SeparatorMenuItem())
+        header(sub, "BAR STYLE")
+        radio_group(sub, [(f"{full * 3}{blank * 2}  {key.capitalize()}", settings["bars"] == key,
+                           lambda k=key: set_setting("bars", k))
+                          for key, (full, blank) in BAR_STYLES.items()])
+        return sub
+
+    def build_customize_menu():
+        sub = Gtk.Menu()
+        header(sub, "SHOW IN MENU")
+        for key, label in MENU_SECTIONS:
+            mi = Gtk.CheckMenuItem(label=label)
+            mi.set_active(settings["show"][key])
+            mi.connect("toggled", toggle_section, key)
+            sub.append(mi)
+        return sub
+
     def build_menu(stats, limit):
         menu = Gtk.Menu()
 
@@ -687,6 +803,8 @@ def run_indicator(override):
             item("Mark Limit Reached", mark_limit_reached)
         item("Limit").set_submenu(build_limit_menu())
         item("Alerts").set_submenu(build_alerts_menu())
+        item("Appearance").set_submenu(build_appearance_menu())
+        item("Customize Menu").set_submenu(build_customize_menu())
         menu.append(Gtk.SeparatorMenuItem())
         item("Refresh Now", lambda _: refresh(force=True))
         item("Quit Claude Usage", lambda _: Gtk.main_quit())
@@ -698,7 +816,7 @@ def run_indicator(override):
             stats = compute(reader)
             current["stats"] = stats
             limit = effective_limit(settings, override)
-            frac, color = gauge(stats, limit)
+            frac, color = gauge(stats, limit, accent_color(settings))
 
             alert = due_alert(stats, limit, settings, state)
             if alert:
@@ -706,14 +824,14 @@ def run_indicator(override):
                 notify(*alert, frac=frac, color=color)
             if current["was_active"] and not stats["block_active"] and settings["reset_alert"]:
                 notify("Your 5-hour block has ended",
-                       "Usage starts fresh with your next message.", 0.0, "ok")
+                       "Usage starts fresh with your next message.", 0.0, COLORS["ok"])
             current["was_active"] = stats["block_active"]
 
             # Only touch the panel when something visible changed: replacing the
             # menu closes it if it's open, and refreshes are frequent.
-            icon, label = icon_path(frac, color), panel_label(stats, limit)
+            icon, label = icon_path(frac, color), panel_label(stats, limit, settings["panel"])
             shown = (icon, label, tuple(menu_lines(stats, limit, settings)),
-                     json.dumps(settings, sort_keys=True),
+                     json.dumps(settings, sort_keys=True), system_accent(),
                      stats["block_active"] and billable(stats["block"]) > 0)
             if force or shown != current["shown"]:
                 current["shown"] = shown
@@ -724,6 +842,11 @@ def run_indicator(override):
             ind.set_label(" err", "")
             print("refresh error:", e, file=sys.stderr)
         return True
+
+    # Follow the system accent the moment it changes, not at the next refresh.
+    if system_accent():
+        interface = Gio.Settings.new("org.gnome.desktop.interface")
+        interface.connect("changed::accent-color", lambda *_: refresh())
 
     refresh()
     GLib.timeout_add_seconds(REFRESH_SECONDS, refresh)
