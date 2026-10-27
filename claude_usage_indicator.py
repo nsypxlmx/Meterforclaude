@@ -507,10 +507,13 @@ def clock(dt):
     return dt.astimezone().strftime("%H:%M")
 
 
-def time_left(stats):
-    left = stats["block_reset"] - datetime.now(timezone.utc)
-    mins = max(int(left.total_seconds() // 60), 0)
+def duration(seconds):
+    mins = max(int(seconds // 60), 0)
     return f"{mins // 60}h{mins % 60:02d}m"
+
+
+def time_left(stats):
+    return duration((stats["block_reset"] - datetime.now(timezone.utc)).total_seconds())
 
 
 def block_elapsed(stats):
@@ -560,8 +563,9 @@ def projection(stats, limit):
     if limit:
         secs = (limit - used) / rate
         if secs < left:
-            return f"Limit likely around {clock(now + timedelta(seconds=secs))}"
-        return f"On pace for about {int((used + rate * left) * 100 / limit)}% by reset"
+            return (f"Limit likely at {clock(now + timedelta(seconds=secs))}, "
+                    f"{duration(left - secs)} before reset")
+        return f"On pace for about {int((used + rate * left) * 100 / limit)}% by reset, under the limit"
     return f"On pace for about {fmt(used + rate * left)} by {clock(stats['block_reset'])}"
 
 
@@ -855,9 +859,12 @@ def menu_lines(stats, limit, settings):
         weekly = plan["seven_day"]
         main.append((f"{bar(weekly['pct'] / 100, bars)}  {weekly['pct']:.0f}% of weekly limit  ·  "
                      f"resets {weekly['reset'].astimezone():%a %H:%M}", "main", "weekly"))
-    forecast = projection(stats, limit) if show["forecast"] else None
-    if forecast:
-        main.append((forecast, "main"))
+    if stats["block_active"]:
+        line = f"{time_left(stats)} left"
+        forecast = projection(stats, limit) if show["forecast"] else None
+        if forecast:
+            line += f"  ·  {forecast[0].lower()}{forecast[1:]}"
+        main.append((line, "main", "time"))
     if plan and datetime.now(timezone.utc) - plan["updated"] > STALE_AFTER:
         main.append((f"Plan limits as of {clock(plan['updated'])}", "dim"))
 
@@ -871,7 +878,7 @@ def menu_lines(stats, limit, settings):
                  f"{time_left(stats)} left", "main", "time")]
         if plan:
             rows.append((f"Plan limits from Claude Code, updated {clock(plan['updated'])}", "dim"))
-        submenus.append(("Details", with_cost_note(rows)))
+        submenus.append((f"Details  ·  {fmt(billable(b))} tokens", with_cost_note(rows)))
 
     if show["history"]:
         values = [n for _, n in stats["days"]]
@@ -881,7 +888,10 @@ def menu_lines(stats, limit, settings):
         if peak:
             rows.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
                          f"cache reads {fmt(stats['week']['cr'])}", "dim"))
-        submenus.append(("History", with_cost_note(rows)))
+        submenus.append((f"History  ·  {fmt(billable(stats['today']))} today", with_cost_note(rows)))
+
+    def short(name, width=22):
+        return name if len(name) <= width else name[:width - 1] + "…"
 
     def breakdown(kind, by_key, label, single, top):
         """Ranked share rows for one period; a lone entry collapses to one line."""
@@ -889,11 +899,15 @@ def menu_lines(stats, limit, settings):
         items = {k: tk for k, tk in by_key.get(scope, {}).items() if billable(tk)}
         if not items:
             return
-        rows = [(dict(SCOPES).get(scope, "This Block").upper(), "dim")]
+        period = dict(SCOPES).get(scope, "This Block")
+        rows = [(period.upper(), "dim")]
         ranked = sorted(items.items(), key=lambda x: -billable(x[1]))
+        title = kind.capitalize()
         if len(ranked) == 1:
+            # Nothing to compare, so the one line goes straight in the menu.
             key, tk = ranked[0]
-            rows.append((f"{single} {label(key)}  ·  {fmt(billable(tk))}{cost(tk)}", "main"))
+            submenus.append((f"{title}  ·  {single} {short(label(key))} {period.lower()}", None))
+            return
         else:
             total = sum(billable(tk) for _, tk in ranked)
             shown = [(label(key), tk) for key, tk in ranked[:top]]
@@ -906,7 +920,9 @@ def menu_lines(stats, limit, settings):
                 share = billable(tk) / total
                 rows.append((f"{bar(share, bars, width=8)}  {name}  {share * 100:.0f}%  ·  "
                              f"{fmt(billable(tk))}{cost(tk)}", "main"))
-        submenus.append((kind.capitalize(), with_cost_note(rows)))
+        top_key, top_tk = ranked[0]
+        share = billable(top_tk) * 100 / sum(billable(tk) for _, tk in ranked)
+        submenus.append((f"{title}  ·  {short(label(top_key))} {share:.0f}%", with_cost_note(rows)))
 
     if show["projects"]:
         breakdown("projects", stats["projects"], str, "All in", top=5)
@@ -979,6 +995,9 @@ def run_once(override):
 
     show_rows(content["main"], "")
     for title, rows in content["submenus"]:
+        if rows is None:
+            print(f"\n{title}")
+            continue
         print(f"\n{title} ▸")
         show_rows(rows, "    ")
 
@@ -1125,6 +1144,9 @@ def run_indicator(override):
         if content["submenus"]:
             menu.append(Gtk.SeparatorMenuItem())
             for title, rows in content["submenus"]:
+                if rows is None:
+                    item(title)
+                    continue
                 sub = Gtk.Menu()
                 fill(sub, rows)
                 item(title).set_submenu(sub)
