@@ -44,6 +44,27 @@ COLORS = {
     "warn": "#F2B33D",
     "high": "#E5534B",
 }
+# Anthropic API list prices, $ per million tokens: (input, output, cache read).
+# Cache writes bill at 1.25x input (5-minute TTL) or 2x input (1-hour TTL).
+# Source: Claude API model table, October 2026.
+PRICES = {
+    "claude-fable-5-1": (10.00, 50.00, 0.25),
+    "claude-mythos-5-1": (10.00, 50.00, 0.25),
+    "claude-fable-5": (10.00, 50.00, 1.00),
+    "claude-mythos-5": (10.00, 50.00, 1.00),
+    "claude-opus-5-5": (4.00, 20.00, 0.20),
+    "claude-opus-5": (5.00, 25.00, 0.50),
+    "claude-opus-4-8": (5.00, 25.00, 0.50),
+    "claude-opus-4-7": (5.00, 25.00, 0.50),
+    "claude-opus-4-6": (5.00, 25.00, 0.50),
+    "claude-sonnet-5-5": (2.00, 10.00, 0.20),
+    "claude-sonnet-5": (2.00, 10.00, 0.20),
+    "claude-sonnet-4-6": (3.00, 15.00, 0.30),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-haiku-4-5": (1.00, 5.00, 0.10),
+}
+# Models whose price steps up past a prompt size: (threshold, prices above it).
+LONG_PROMPT_PRICES = {"claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05))}
 ALERT_CHOICES = [[50, 80], [75, 90], [90], []]
 DEFAULT_SETTINGS = {
     "limit_mode": "auto",   # auto | custom | none
@@ -60,6 +81,42 @@ def fmt(n):
     if n >= 1_000:
         return f"{n / 1_000:.1f}".rstrip("0").rstrip(".") + "K"
     return str(int(n))
+
+
+def money(usd):
+    return f"${usd:,.2f}" if usd < 100 else f"${usd:,.0f}"
+
+
+def entry_cost(model, usage):
+    """API list-price equivalent in USD, or None for a model without a known price."""
+    base = re.sub(r"-\d{8}$", "", model)
+    if base not in PRICES:
+        return None
+    inp, out, read = PRICES[base]
+    n_in = usage.get("input_tokens", 0) or 0
+    n_out = usage.get("output_tokens", 0) or 0
+    n_read = usage.get("cache_read_input_tokens", 0) or 0
+    n_write = usage.get("cache_creation_input_tokens", 0) or 0
+    long_prompt = LONG_PROMPT_PRICES.get(base)
+    if long_prompt and n_in + n_read + n_write > long_prompt[0]:
+        inp, out, read = long_prompt[1]
+    write_1h = min((usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0) or 0, n_write)
+    usd = (n_in * inp + n_out * out + n_read * read
+           + (n_write - write_1h) * inp * 1.25 + write_1h * inp * 2) / 1_000_000
+    if usage.get("speed") == "fast":  # fast mode is billed at 2x the standard rates
+        usd *= 2
+    return usd
+
+
+def project_name(cwd):
+    home = os.path.expanduser("~")
+    if not cwd:
+        return "Unknown"
+    if cwd.rstrip("/") == home:
+        return "~ (home)"
+    if cwd.startswith(os.path.join(home, ".claude")):
+        return "~/.claude"
+    return os.path.basename(cwd.rstrip("/"))
 
 
 def parse_tokens(text):
@@ -111,7 +168,7 @@ def effective_limit(settings, override=0):
 
 
 def load_entries():
-    """Return list of (datetime_utc, model, tokens_dict), deduplicated."""
+    """Return list of (datetime_utc, model, tokens_dict, project), deduplicated."""
     seen = set()
     entries = []
     files = []
@@ -144,12 +201,17 @@ def load_entries():
                         t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                     except ValueError:
                         continue
-                    entries.append((t, msg.get("model", "unknown"), {
+                    model = msg.get("model", "unknown")
+                    tk = {
                         "in": usage.get("input_tokens", 0) or 0,
                         "out": usage.get("output_tokens", 0) or 0,
                         "cw": usage.get("cache_creation_input_tokens", 0) or 0,
                         "cr": usage.get("cache_read_input_tokens", 0) or 0,
-                    }))
+                    }
+                    usd = entry_cost(model, usage)
+                    tk["usd"] = usd or 0.0
+                    tk["unpriced"] = billable(tk) if usd is None else 0
+                    entries.append((t, model, tk, project_name(obj.get("cwd"))))
         except OSError:
             continue
     entries.sort(key=lambda e: e[0])
@@ -171,7 +233,7 @@ def add(acc, tokens):
 
 
 def empty():
-    return {"in": 0, "out": 0, "cw": 0, "cr": 0}
+    return {"in": 0, "out": 0, "cw": 0, "cr": 0, "usd": 0.0, "unpriced": 0}
 
 
 def compute():
@@ -184,7 +246,7 @@ def compute():
 
     # Find the active 5h block (blocks start at the hour of their first message).
     block_start = None
-    for t, _, _ in entries:
+    for t, _, _, _ in entries:
         if block_start is None or t >= block_start + timedelta(hours=BLOCK_HOURS):
             block_start = t.replace(minute=0, second=0, microsecond=0)
     block_active = block_start is not None and now < block_start + timedelta(hours=BLOCK_HOURS)
@@ -193,7 +255,8 @@ def compute():
     days = [0] * 7
     recent = 0
     models = defaultdict(int)
-    for t, model, tk in entries:
+    projects = defaultdict(empty)
+    for t, model, tk, project in entries:
         if block_active and t >= block_start:
             add(block, tk)
             if model != "<synthetic>":
@@ -202,12 +265,14 @@ def compute():
                 recent += billable(tk)
         if t >= today_start:
             add(today, tk)
+            add(projects[project], tk)
         if t >= week_start:
             add(week, tk)
             days[(t.astimezone().date() - day_starts[0].date()).days] += billable(tk)
 
     return {
         "block": block, "today": today, "week": week, "models": dict(models),
+        "projects": dict(projects),
         "days": list(zip(day_starts, days)),
         "recent": recent,
         "block_active": block_active,
@@ -342,20 +407,36 @@ def menu_lines(stats, limit, settings):
         if forecast:
             lines.append((forecast, "main"))
         lines.append((f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  "
-                      f"cache {fmt(b['cw'] + b['cr'])}", "dim"))
+                      f"cache {fmt(b['cw'] + b['cr'])}  ·  ≈ {money(b['usd'])}", "dim"))
         if not limit and settings["limit_mode"] == "auto":
             lines.append(("Hit your limit? Choose Mark Limit Reached to calibrate", "dim"))
     else:
         lines.append(("No active block, starts with your next message", "main"))
 
     lines += [None, ("TODAY & LAST 7 DAYS", "dim")]
-    lines.append((f"Today  {fmt(billable(stats['today']))}", "main"))
+    lines.append((f"Today  {fmt(billable(stats['today']))}  ·  ≈ {money(stats['today']['usd'])}", "main"))
     values = [n for _, n in stats["days"]]
-    lines.append((f"{spark(values)}  {fmt(sum(values))} in 7 days", "main"))
+    lines.append((f"{spark(values)}  {fmt(sum(values))} in 7 days  ·  "
+                  f"≈ {money(stats['week']['usd'])}", "main"))
     peak_day, peak = max(stats["days"], key=lambda d: d[1])
     if peak:
         lines.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
                       f"cache reads {fmt(stats['week']['cr'])}", "dim"))
+    note = "≈ is what this usage would cost at API list prices"
+    if stats["week"]["unpriced"]:
+        note += f"; {fmt(stats['week']['unpriced'])} tokens on unpriced models not included"
+    lines.append((note, "dim"))
+
+    active = {p: tk for p, tk in stats["projects"].items() if billable(tk)}
+    if active:
+        lines += [None, ("TODAY BY PROJECT", "dim")]
+        ranked = sorted(active.items(), key=lambda x: -billable(x[1]))
+        for name, tk in ranked[:5]:
+            lines.append((f"{name}  {fmt(billable(tk))}  ·  ≈ {money(tk['usd'])}", "main"))
+        if len(ranked) > 5:
+            rest = ranked[5:]
+            lines.append((f"{len(rest)} more  {fmt(sum(billable(tk) for _, tk in rest))}  ·  "
+                          f"≈ {money(sum(tk['usd'] for _, tk in rest))}", "dim"))
 
     if stats["models"]:
         lines += [None, ("BLOCK BY MODEL", "dim")]
