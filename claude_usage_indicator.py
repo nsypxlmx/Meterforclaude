@@ -19,6 +19,7 @@ import argparse
 import copy
 import functools
 import glob
+import hashlib
 import json
 import math
 import os
@@ -128,6 +129,7 @@ DEFAULT_SETTINGS = {
     "icon_style": "symbolic",  # a key of ICON_STYLES
     "accent": "system",     # "system" or a key of ACCENTS; used by the color style
     "pinned": ["five_hour", "time"],  # keys of PANEL_METRICS shown in the top bar
+    "draw_values": True,    # draw pinned values into the icon, labels dimmer than numbers
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
     "animate": True,        # pulse the ring's center while Claude is writing
@@ -659,22 +661,137 @@ def pad(text, width):
     return FIGURE_SPACE * max(width - len(text), 0) + text
 
 
-def panel_metric(key, stats, limit):
-    """Text for one pinned top-bar value, or None when it has nothing to show."""
+def panel_parts(key, stats, limit):
+    """(label, value, fraction of a limit or None) for one pinned top-bar value,
+    or None when it has nothing to show."""
     active, plan = stats["block_active"], stats["plan"]
     if key == "five_hour" and active:
         if has_limit(stats, limit):
-            return f"5h{used_pct(stats, limit)}%"
-        return f"5h{fmt(billable(stats['block']))}"
+            pct = used_pct(stats, limit)
+            return "5h", f"{pct}%", pct / 100
+        return "5h", fmt(billable(stats["block"])), None
     if key == "weekly" and "seven_day" in plan:
-        return f"7d{round(plan['seven_day']['pct'])}%"
+        pct = round(plan["seven_day"]["pct"])
+        return "7d", f"{pct}%", pct / 100
     if key == "time" and active:
-        return f"↻{time_left(stats)}"
+        return "↻", time_left(stats), None
     if key == "tokens" and active:
-        return pad(fmt(billable(stats["block"])), 6)
+        return "", pad(fmt(billable(stats["block"])), 6), None
     if key == "cost":
-        return money(stats["today"]["usd"])
+        return "", money(stats["today"]["usd"]), None
     return None
+
+
+def panel_metric(key, stats, limit):
+    """Text for one pinned top-bar value, or None when it has nothing to show."""
+    parts = panel_parts(key, stats, limit)
+    return parts[0] + parts[1] if parts else None
+
+
+def panel_segments(stats, limit, settings):
+    """The pinned values that have something to show, as panel_parts tuples."""
+    return [parts for parts in (panel_parts(key, stats, limit)
+                                for key, _, _ in PANEL_METRICS if key in settings["pinned"])
+            if parts]
+
+
+PANEL_ICON_PX = 16      # the top bar's icon height in logical pixels
+LABEL_OPACITY = 0.55    # "5h", "7d" and "↻" next to their bright numbers
+MAX_PANEL_ICONS = 60    # drawn top-bar images kept in the cache
+
+
+@functools.lru_cache(maxsize=1)
+def panel_font():
+    """(family, weight, size in px) of the top bar's text, from the interface font.
+    GNOME draws top-bar text bold."""
+    import gi
+    gi.require_version("Pango", "1.0")
+    from gi.repository import Gio, Pango
+    interface = Gio.Settings.new("org.gnome.desktop.interface")
+    desc = Pango.FontDescription.from_string(interface.get_string("font-name"))
+    size = desc.get_size() / Pango.SCALE
+    if not desc.get_size_is_absolute():
+        size *= 96 / 72
+    return desc.get_family() or "Sans", 700, size * interface.get_double("text-scaling-factor")
+
+
+def panel_icon_path(frac, color, inner, segments, pulse=None):
+    """The ring with the pinned values drawn beside it, as one wide SVG.
+
+    Tray labels are plain text in a single color; drawing the values ourselves
+    lets "5h" and "7d" sit a shade dimmer than the numbers, as in Vitals. The
+    text goes in as outlines: GNOME loads tray images in a sandbox that can't
+    see fonts installed in your home folder."""
+    import io
+    import cairo
+    import gi
+    gi.require_version("Pango", "1.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Pango, PangoCairo
+
+    unit = 64 / PANEL_ICON_PX           # SVG units per logical pixel
+    family, weight, px = panel_font()
+    desc = Pango.FontDescription()
+    desc.set_family(family)
+    desc.set_weight(Pango.Weight(weight))
+    desc.set_absolute_size(px * unit * Pango.SCALE)
+
+    def layout(ctx, text):
+        lay = PangoCairo.create_layout(ctx)
+        lay.set_font_description(desc)
+        lay.set_text(text, -1)
+        return lay
+
+    def draw(ctx):
+        """Draw the values on ctx (if given) and return the width they take."""
+        measure = ctx or cairo.Context(cairo.ImageSurface(cairo.FORMAT_A8, 1, 1))
+        space = layout(measure, " ").get_extents()[1].width / Pango.SCALE
+        metrics = layout(measure, " ").get_context().get_metrics(desc, None)
+        ascent = metrics.get_ascent() / Pango.SCALE
+        descent = metrics.get_descent() / Pango.SCALE
+        top = 32 - (ascent + descent) / 2
+        x = space * 0.75
+        for i, (label, value, part_frac) in enumerate(segments):
+            if i:
+                x += space
+            for text, opacity, fill in ((label, LABEL_OPACITY, SYMBOLIC),
+                                        (value, 1, threshold_color(part_frac or 0))):
+                if not text:
+                    continue
+                lay = layout(measure, text)
+                if ctx:
+                    r, g, b = (int(fill[i:i + 2], 16) / 255 for i in (1, 3, 5))
+                    ctx.set_source_rgba(r, g, b, opacity)
+                    ctx.move_to(x, top + ascent - lay.get_baseline() / Pango.SCALE)
+                    PangoCairo.show_layout(ctx, lay)
+                x += lay.get_extents()[1].width / Pango.SCALE
+        return math.ceil(x + unit)
+
+    text_width = draw(None)
+    buf = io.BytesIO()
+    surface = cairo.SVGSurface(buf, text_width, 64)
+    surface.set_document_unit(cairo.SVGUnit.USER)
+    draw(cairo.Context(surface))
+    surface.finish()
+    text_svg = buf.getvalue().decode()
+    text_svg = text_svg[text_svg.index("<svg"):].replace("<svg ", '<svg x="64" ', 1)
+
+    ring = open(icon_path(frac, color, inner, pulse)).read()
+    width = 64 + text_width
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+           f'width="{width}" height="64" viewBox="0 0 {width} 64">'
+           + ring.replace('<svg xmlns="http://www.w3.org/2000/svg" ', '<svg ', 1)
+           + text_svg + '</svg>')
+    name = "panel-" + hashlib.sha1(svg.encode()).hexdigest()[:16]
+    path = os.path.join(ICON_DIR, name + ".svg")
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(svg)
+        # The time left changes every minute; keep only the most recent images.
+        drawn = sorted(glob.glob(os.path.join(ICON_DIR, "panel-*.svg")), key=os.path.getmtime)
+        for old in drawn[:-MAX_PANEL_ICONS]:
+            os.remove(old)
+    return path
 
 
 def panel_label(stats, limit, settings):
@@ -884,7 +1001,8 @@ def run_indicator(override):
     state = read_json(STATE_PATH, {})
     reader = LogReader()
     current = {"stats": None, "was_active": None, "shown": None,
-               "spec": None, "anim": None, "frame": 0, "settings_mtime": settings_mtime()}
+               "spec": None, "anim": None, "frame": 0, "settings_mtime": settings_mtime(),
+               "segments": None, "label": ("", "")}
 
     tray = None
     schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
@@ -934,9 +1052,15 @@ def run_indicator(override):
                          start_new_session=True)
 
     def current_icon():
-        if current["anim"]:
-            return icon_path(*current["spec"], pulse=current["frame"])
-        return icon_path(*current["spec"])
+        pulse = current["frame"] if current["anim"] else None
+        if current["segments"]:
+            try:
+                return panel_icon_path(*current["spec"], current["segments"], pulse)
+            except Exception as e:  # fall back to the plain text label
+                print("draw error:", e, file=sys.stderr)
+                current["segments"] = None
+                ind.set_label(*current["label"])
+        return icon_path(*current["spec"], pulse=pulse)
 
     def step_pulse():
         current["frame"] = (current["frame"] + 1) % PULSE_FRAMES
@@ -1029,13 +1153,18 @@ def run_indicator(override):
             # menu closes it if it's open, and refreshes are frequent.
             icon = icon_path(frac, color, inner)
             label, guide = panel_label(stats, limit, settings)
+            current["label"] = (label, guide)
+            segments = panel_segments(stats, limit, settings) if settings["draw_values"] else []
+            if segments:
+                icon = repr(segments)
             shown = (icon, label, repr(menu_lines(stats, limit, settings)),
                      json.dumps(settings, sort_keys=True), system_accent(),
                      stats["block_active"] and billable(stats["block"]) > 0)
             if force or shown != current["shown"]:
                 current["shown"] = shown
+                current["segments"] = segments or None
+                ind.set_label(*(("", "") if segments else (label, guide)))
                 ind.set_icon_full(current_icon(), "Claude usage")
-                ind.set_label(label, guide)
                 ind.set_menu(build_menu(stats, limit))
         except Exception as e:  # keep the tray alive on parse errors
             ind.set_label(" err", "")
@@ -1126,7 +1255,11 @@ def run_settings():
         top_groups = [
             group("Pinned Values",
                   [switch_row(label, key in s["pinned"], lambda on, k=key: set_pinned(k, on))
-                   for key, label, _ in PANEL_METRICS],
+                   for key, label, _ in PANEL_METRICS]
+                  + [switch_row("Dim Labels", s["draw_values"],
+                                lambda on: update_settings(draw_values=on),
+                                "Draws the values as part of the icon so 5h and 7d can be "
+                                "dimmer than the numbers. Turn off to use plain top-bar text")],
                   "Shown next to the icon. You can also click a value in the menu to pin it."),
             group("Icon", [
                 combo_row("Style", ICON_STYLES, s["icon_style"], set_style,
