@@ -33,7 +33,8 @@ ICON_DIR = os.path.expanduser("~/.cache/claude-usage")
 STATE_PATH = os.path.join(ICON_DIR, "state.json")
 SETTINGS_PATH = os.path.expanduser("~/.config/claude-usage/settings.json")
 BLOCK_HOURS = 5
-REFRESH_SECONDS = 60
+REFRESH_SECONDS = 15
+HISTORY_DAYS = 8
 RATE_WINDOW = timedelta(minutes=30)
 LEARN_FROM = 5  # most recent marked blocks used for the learned limit
 SPARK = "▁▂▃▄▅▆▇█"
@@ -167,55 +168,89 @@ def effective_limit(settings, override=0):
     return 0
 
 
-def load_entries():
-    """Return list of (datetime_utc, model, tokens_dict, project), deduplicated."""
-    seen = set()
-    entries = []
-    files = []
-    for d in PROJECT_DIRS:
-        files += glob.glob(os.path.join(d, "**", "*.jsonl"), recursive=True)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=8)
-    for path in files:
-        try:
-            if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) < cutoff:
+def parse_line(line):
+    """One log line -> (dedup key, (datetime_utc, model, tokens_dict, project)), or None."""
+    if '"usage"' not in line:
+        return None
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    msg = obj.get("message") or {}
+    usage = msg.get("usage")
+    ts = obj.get("timestamp")
+    if not usage or not ts:
+        return None
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    model = msg.get("model", "unknown")
+    tk = {
+        "in": usage.get("input_tokens", 0) or 0,
+        "out": usage.get("output_tokens", 0) or 0,
+        "cw": usage.get("cache_creation_input_tokens", 0) or 0,
+        "cr": usage.get("cache_read_input_tokens", 0) or 0,
+    }
+    usd = entry_cost(model, usage)
+    tk["usd"] = usd or 0.0
+    tk["unpriced"] = billable(tk) if usd is None else 0
+    return (msg.get("id"), obj.get("requestId")), (t, model, tk, project_name(obj.get("cwd")))
+
+
+class LogReader:
+    """Parsed log entries per file; each refresh reads only bytes appended since the last."""
+
+    def __init__(self):
+        self.files = {}  # path -> {"ino", "offset", "entries": [(key, entry)]}
+
+    def _read_new(self, path, state):
+        with open(path, "rb") as f:
+            f.seek(state["offset"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1  # leave a half-written last line for next time
+        if not end:
+            return
+        state["offset"] += end
+        for line in data[:end].decode("utf-8", errors="ignore").splitlines():
+            parsed = parse_line(line)
+            if parsed:
+                state["entries"].append(parsed)
+
+    def entries(self):
+        """Return sorted (datetime_utc, model, tokens_dict, project), deduplicated."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
+        paths = set()
+        for d in PROJECT_DIRS:
+            paths.update(glob.glob(os.path.join(d, "**", "*.jsonl"), recursive=True))
+        for path in set(self.files) - paths:
+            del self.files[path]
+        for path in paths:
+            try:
+                st = os.stat(path)
+                if st.st_mtime < cutoff.timestamp():
+                    self.files.pop(path, None)
+                    continue
+                state = self.files.get(path)
+                if state is None or state["ino"] != st.st_ino or st.st_size < state["offset"]:
+                    state = self.files[path] = {"ino": st.st_ino, "offset": 0, "entries": []}
+                if st.st_size > state["offset"]:
+                    self._read_new(path, state)
+            except OSError:
                 continue
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if '"usage"' not in line:
+
+        seen = set()
+        entries = []
+        for state in self.files.values():
+            state["entries"] = [e for e in state["entries"] if e[1][0] >= cutoff]
+            for key, entry in state["entries"]:
+                if key != (None, None):
+                    if key in seen:
                         continue
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        continue
-                    msg = obj.get("message") or {}
-                    usage = msg.get("usage")
-                    ts = obj.get("timestamp")
-                    if not usage or not ts:
-                        continue
-                    key = (msg.get("id"), obj.get("requestId"))
-                    if key != (None, None):
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                    try:
-                        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    model = msg.get("model", "unknown")
-                    tk = {
-                        "in": usage.get("input_tokens", 0) or 0,
-                        "out": usage.get("output_tokens", 0) or 0,
-                        "cw": usage.get("cache_creation_input_tokens", 0) or 0,
-                        "cr": usage.get("cache_read_input_tokens", 0) or 0,
-                    }
-                    usd = entry_cost(model, usage)
-                    tk["usd"] = usd or 0.0
-                    tk["unpriced"] = billable(tk) if usd is None else 0
-                    entries.append((t, model, tk, project_name(obj.get("cwd"))))
-        except OSError:
-            continue
-    entries.sort(key=lambda e: e[0])
-    return entries
+                    seen.add(key)
+                entries.append(entry)
+        entries.sort(key=lambda e: e[0])
+        return entries
 
 
 def total(tokens):
@@ -236,8 +271,8 @@ def empty():
     return {"in": 0, "out": 0, "cw": 0, "cr": 0, "usd": 0.0, "unpriced": 0}
 
 
-def compute():
-    entries = load_entries()
+def compute(reader=None):
+    entries = (reader or LogReader()).entries()
     now = datetime.now(timezone.utc)
     local_today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     today_start = local_today.astimezone(timezone.utc)
@@ -502,7 +537,8 @@ def run_indicator(override):
 
     settings = load_settings()
     state = read_json(STATE_PATH, {"block": None, "alerted": []})
-    current = {"stats": None, "was_active": None}
+    reader = LogReader()
+    current = {"stats": None, "was_active": None, "shown": None}
 
     def save_settings():
         write_json(SETTINGS_PATH, settings)
@@ -652,14 +688,14 @@ def run_indicator(override):
         item("Limit").set_submenu(build_limit_menu())
         item("Alerts").set_submenu(build_alerts_menu())
         menu.append(Gtk.SeparatorMenuItem())
-        item("Refresh Now", lambda _: refresh())
+        item("Refresh Now", lambda _: refresh(force=True))
         item("Quit Claude Usage", lambda _: Gtk.main_quit())
         menu.show_all()
         return menu
 
-    def refresh():
+    def refresh(force=False):
         try:
-            stats = compute()
+            stats = compute(reader)
             current["stats"] = stats
             limit = effective_limit(settings, override)
             frac, color = gauge(stats, limit)
@@ -673,9 +709,17 @@ def run_indicator(override):
                        "Usage starts fresh with your next message.", 0.0, "ok")
             current["was_active"] = stats["block_active"]
 
-            ind.set_icon_full(icon_path(frac, color), "Claude usage")
-            ind.set_label(panel_label(stats, limit), "00000000000")
-            ind.set_menu(build_menu(stats, limit))
+            # Only touch the panel when something visible changed: replacing the
+            # menu closes it if it's open, and refreshes are frequent.
+            icon, label = icon_path(frac, color), panel_label(stats, limit)
+            shown = (icon, label, tuple(menu_lines(stats, limit, settings)),
+                     json.dumps(settings, sort_keys=True),
+                     stats["block_active"] and billable(stats["block"]) > 0)
+            if force or shown != current["shown"]:
+                current["shown"] = shown
+                ind.set_icon_full(icon, "Claude usage")
+                ind.set_label(label, "00000000000")
+                ind.set_menu(build_menu(stats, limit))
         except Exception as e:  # keep the tray alive on parse errors
             ind.set_label(" err", "")
             print("refresh error:", e, file=sys.stderr)
