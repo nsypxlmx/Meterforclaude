@@ -1132,8 +1132,14 @@ def run_indicator(override):
                     mi.set_sensitive(row[1] != "dim")
                 target.append(mi)
 
-        def item(text, cb=None):
-            mi = Gtk.MenuItem(label=text)
+        def item(text, cb=None, icon=None):
+            if icon:
+                # ImageMenuItem is deprecated in GTK 3 but is how DBusMenu
+                # passes an icon to the top-bar menu.
+                mi = Gtk.ImageMenuItem(label=text, always_show_image=True,
+                                       image=Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
+            else:
+                mi = Gtk.MenuItem(label=text)
             if cb:
                 mi.connect("activate", cb)
             menu.append(mi)
@@ -1154,8 +1160,8 @@ def run_indicator(override):
         if (stats["block_active"] and billable(stats["block"]) and not override
                 and "five_hour" not in stats["plan"]):
             item("Mark Limit Reached", mark_limit_reached)
-        item("Settings…", open_settings)
-        item("Quit Claude Usage", lambda _: Gtk.main_quit())
+        item("Settings…", open_settings, "emblem-system-symbolic")
+        item("Quit Claude Usage", lambda _: Gtk.main_quit(), "application-exit-symbolic")
         menu.show_all()
         return menu
 
