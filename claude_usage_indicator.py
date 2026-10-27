@@ -15,6 +15,7 @@ Usage:
     claude_usage_indicator.py --limit 5000000 # override the limit per 5h block
 """
 import argparse
+import functools
 import glob
 import json
 import math
@@ -82,7 +83,8 @@ MENU_SECTIONS = [
     ("projects", "Projects"),
     ("models", "Models"),
 ]
-MODEL_SCOPES = [("block", "This Block"), ("today", "Today"), ("week", "Last 7 Days")]
+# Periods the model and project breakdowns can cover.
+SCOPES = [("block", "This Block"), ("today", "Today"), ("week", "Last 7 Days")]
 # Anthropic API list prices, $ per million tokens: (input, output, cache read).
 # Cache writes bill at 1.25x input (5-minute TTL) or 2x input (1-hour TTL).
 # Source: Claude API model table, October 2026.
@@ -116,7 +118,8 @@ DEFAULT_SETTINGS = {
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
     "animate": True,        # pulse the ring's center while Claude is writing
-    "models_scope": "block",  # a key of MODEL_SCOPES
+    "models_scope": "block",    # a key of SCOPES
+    "projects_scope": "today",  # a key of SCOPES
 }
 # Where GNOME's AppIndicator extension places tray icons; it applies to all of them.
 TRAY_SCHEMA = "org.gnome.shell.extensions.appindicator"
@@ -159,15 +162,24 @@ def entry_cost(model, usage):
     return usd
 
 
+@functools.lru_cache(maxsize=512)
 def project_name(cwd):
+    """Name usage after the git repository it happened in, so subfolders count
+    toward their project; outside a repository, the folder's own name."""
     home = os.path.expanduser("~")
     if not cwd:
         return "Unknown"
-    if cwd.rstrip("/") == home:
+    cwd = cwd.rstrip("/") or "/"
+    if cwd == home:
         return "~ (home)"
     if cwd.startswith(os.path.join(home, ".claude")):
         return "~/.claude"
-    return os.path.basename(cwd.rstrip("/"))
+    folder = cwd
+    while folder not in (home, "/"):
+        if os.path.exists(os.path.join(folder, ".git")):
+            return os.path.basename(folder)
+        folder = os.path.dirname(folder)
+    return os.path.basename(cwd)
 
 
 def parse_tokens(text):
@@ -393,31 +405,32 @@ def compute(reader=None, plan=None):
     block, today, week = empty(), empty(), empty()
     days = [0] * 7
     recent = 0
-    models = {scope: defaultdict(empty) for scope, _ in MODEL_SCOPES}
-    projects = defaultdict(empty)
+    models = {scope: defaultdict(empty) for scope, _ in SCOPES}
+    projects = {scope: defaultdict(empty) for scope, _ in SCOPES}
+
+    def tally(scope, model, project, tk):
+        add(projects[scope][project], tk)
+        if model != "<synthetic>":
+            add(models[scope][model], tk)
+
     for t, model, tk, project in entries:
-        counted = model != "<synthetic>"
         if block_active and t >= block_start:
             add(block, tk)
-            if counted:
-                add(models["block"][model], tk)
+            tally("block", model, project, tk)
             if t >= now - RATE_WINDOW:
                 recent += billable(tk)
         if t >= today_start:
             add(today, tk)
-            add(projects[project], tk)
-            if counted:
-                add(models["today"][model], tk)
+            tally("today", model, project, tk)
         if t >= week_start:
             add(week, tk)
             days[(t.astimezone().date() - day_starts[0].date()).days] += billable(tk)
-            if counted:
-                add(models["week"][model], tk)
+            tally("week", model, project, tk)
 
     return {
         "block": block, "today": today, "week": week,
         "models": {scope: dict(by_model) for scope, by_model in models.items()},
-        "projects": dict(projects),
+        "projects": {scope: dict(by_project) for scope, by_project in projects.items()},
         "days": list(zip(day_starts, days)),
         "recent": recent,
         "block_active": block_active,
@@ -656,40 +669,35 @@ def menu_lines(stats, limit, settings):
             lines.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
                           f"cache reads {fmt(stats['week']['cr'])}", "dim"))
 
-    active = {p: tk for p, tk in stats["projects"].items() if billable(tk)}
-    if show["projects"] and active:
-        lines += [None, ("TODAY BY PROJECT", "dim")]
-        ranked = sorted(active.items(), key=lambda x: -billable(x[1]))
-        for name, tk in ranked[:5]:
-            lines.append((f"{name}  {fmt(billable(tk))}{cost(tk)}", "main"))
-        if len(ranked) > 5:
-            rest = empty()
-            for _, tk in ranked[5:]:
-                add(rest, tk)
-            lines.append((f"{len(ranked) - 5} more  {fmt(billable(rest))}{cost(rest)}", "dim"))
-
-    scope = settings["models_scope"]
-    by_model = {m: tk for m, tk in stats["models"].get(scope, {}).items() if billable(tk)}
-    if show["models"] and by_model:
-        scope_label = dict(MODEL_SCOPES).get(scope, "This Block")
-        lines += [None, (f"{scope_label.upper()} BY MODEL", "dim")]
-        ranked = sorted(by_model.items(), key=lambda x: -billable(x[1]))
+    def breakdown(kind, by_key, label, single, top):
+        """Ranked share rows for one period; a lone entry collapses to one line."""
+        scope = settings[f"{kind}_scope"]
+        items = {k: tk for k, tk in by_key.get(scope, {}).items() if billable(tk)}
+        if not items:
+            return
+        title = dict(SCOPES).get(scope, "This Block").upper()
+        lines.extend([None, (f"{title} BY {kind[:-1].upper()}", "dim")])
+        ranked = sorted(items.items(), key=lambda x: -billable(x[1]))
         if len(ranked) == 1:
-            name, tk = ranked[0]
-            lines.append((f"All on {model_name(name)}  ·  {fmt(billable(tk))}{cost(tk)}", "main"))
-        else:
-            scope_total = sum(billable(tk) for _, tk in ranked)
-            rows = ranked[:4]
-            if len(ranked) > 4:
-                rest = empty()
-                for _, tk in ranked[4:]:
-                    add(rest, tk)
-                rows.append((f"{len(ranked) - 4} more", rest))
-            for name, tk in rows:
-                share = billable(tk) / scope_total
-                label = name if name.endswith(" more") else model_name(name)
-                lines.append((f"{bar(share, bars, width=8)}  {label}  {share * 100:.0f}%  ·  "
-                              f"{fmt(billable(tk))}{cost(tk)}", "main"))
+            key, tk = ranked[0]
+            lines.append((f"{single} {label(key)}  ·  {fmt(billable(tk))}{cost(tk)}", "main"))
+            return
+        total = sum(billable(tk) for _, tk in ranked)
+        rows = [(label(key), tk) for key, tk in ranked[:top]]
+        if len(ranked) > top:
+            rest = empty()
+            for _, tk in ranked[top:]:
+                add(rest, tk)
+            rows.append((f"{len(ranked) - top} more", rest))
+        for name, tk in rows:
+            share = billable(tk) / total
+            lines.append((f"{bar(share, bars, width=8)}  {name}  {share * 100:.0f}%  ·  "
+                          f"{fmt(billable(tk))}{cost(tk)}", "main"))
+
+    if show["projects"]:
+        breakdown("projects", stats["projects"], str, "All in", top=5)
+    if show["models"]:
+        breakdown("models", stats["models"], model_name, "All on", top=4)
 
     if show["cost"] and any(line and "≈" in line[0] for line in lines):
         note = "≈ is what this usage would cost at API list prices"
@@ -992,11 +1000,12 @@ def run_indicator(override):
             mi.set_active(settings["show"][key])
             mi.connect("toggled", toggle_section, key)
             sub.append(mi)
-        sub.append(Gtk.SeparatorMenuItem())
-        header(sub, "MODELS COVER")
-        radio_group(sub, [(label, settings["models_scope"] == key,
-                           lambda k=key: set_setting("models_scope", k))
-                          for key, label in MODEL_SCOPES])
+        for kind in ("projects", "models"):
+            sub.append(Gtk.SeparatorMenuItem())
+            header(sub, f"{kind.upper()} COVER")
+            radio_group(sub, [(label, settings[f"{kind}_scope"] == key,
+                               lambda k=key, kind=kind: set_setting(f"{kind}_scope", k))
+                              for key, label in SCOPES])
         return sub
 
     def build_menu(stats, limit):
