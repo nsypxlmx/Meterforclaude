@@ -22,6 +22,7 @@ import os
 import re
 import statistics
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -111,7 +112,14 @@ DEFAULT_SETTINGS = {
     "panel": "usage_time",  # a key of PANEL_STYLES
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
+    "animate": True,        # pulse the ring's center while Claude is writing
 }
+# Where GNOME's AppIndicator extension places tray icons; it applies to all of them.
+TRAY_SCHEMA = "org.gnome.shell.extensions.appindicator"
+TRAY_POSITIONS = [("left", "Left"), ("center", "Center"), ("right", "Right")]
+ACTIVE_SECONDS = 12   # a log written this recently means Claude is mid-reply
+PULSE_FRAMES = 8
+PULSE_MS = 140
 
 
 def fmt(n):
@@ -275,6 +283,16 @@ class LogReader:
             parsed = parse_line(line)
             if parsed:
                 state["entries"].append(parsed)
+
+    def latest_write(self):
+        """Newest modification time among the tracked logs, as a Unix timestamp."""
+        latest = 0.0
+        for path in self.files:
+            try:
+                latest = max(latest, os.stat(path).st_mtime)
+            except OSError:
+                pass
+        return latest
 
     def entries(self):
         """Return sorted (datetime_utc, model, tokens_dict, project), deduplicated."""
@@ -445,32 +463,77 @@ def projection(stats, limit):
     return f"At this pace, about {fmt(used + rate * left)} by {clock(stats['block_reset'])}"
 
 
+def mix(a, b, t):
+    """Blend two #rrggbb colors; t=0 gives a, t=1 gives b."""
+    ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+    cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    t = min(max(t, 0.0), 1.0)
+    return "#" + "".join(f"{round(x + (y - x) * t):02X}" for x, y in zip(ca, cb))
+
+
+def status_color(frac):
+    """Green until 50%, easing through amber at 75% to red at 90%."""
+    if frac < 0.5:
+        return COLORS["ok"]
+    if frac < 0.75:
+        return mix(COLORS["ok"], COLORS["warn"], (frac - 0.5) / 0.25)
+    return mix(COLORS["warn"], COLORS["high"], (frac - 0.75) / 0.15)
+
+
 def gauge(stats, limit, accent):
-    """(fraction, hex color) for the panel ring: limit used, or block time elapsed."""
+    """Ring spec for the panel icon: (fraction, hex color, inner ring or None).
+
+    With a limit, the outer ring is usage and the inner ring is block time,
+    so usage running ahead of the clock is visible at a glance."""
     if not stats["block_active"]:
-        return 0.0, COLORS["idle"]
+        return 0.0, COLORS["idle"], None
     if limit:
         frac = budget_frac(stats, limit)
-        return frac, COLORS["ok" if frac < 0.6 else "warn" if frac < 0.85 else "high"]
-    return block_elapsed(stats), accent
+        return frac, status_color(frac), (block_elapsed(stats), accent)
+    return block_elapsed(stats), accent, None
 
 
-def icon_path(frac, color):
-    """Write (once) and return an SVG ring gauge; 2% steps keep the cache small."""
+def icon_path(frac, color, inner=None, pulse=None):
+    """Write (once) and return an SVG ring gauge; 2% steps keep the cache small.
+
+    pulse is an animation frame index (0..PULSE_FRAMES-1) or None for a still icon."""
     step = int(frac * 50) * 2
-    path = os.path.join(ICON_DIR, f"gauge-{color.lstrip('#').lower()}-{step}.svg")
+    inner_step = int(inner[0] * 50) * 2 if inner else None
+    name = f"gauge-{color.lstrip('#').lower()}-{step}"
+    if inner:
+        name += f"-i{inner[1].lstrip('#').lower()}-{inner_step}"
+    if pulse is not None:
+        name += f"-p{pulse}"
+    path = os.path.join(ICON_DIR, name + ".svg")
     if os.path.exists(path):
         return path
-    r = 22
-    circ = 2 * math.pi * r
-    arc = ""
-    if step:
-        arc = (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="{color}" '
-               f'stroke-width="9" stroke-linecap="round" '
-               f'stroke-dasharray="{circ * step / 100:.2f} {circ:.2f}" transform="rotate(-90 32 32)"/>')
+
+    def ring(r, width, value, stroke, track_opacity):
+        circ = 2 * math.pi * r
+        out = (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="#ffffff" '
+               f'stroke-opacity="{track_opacity}" stroke-width="{width}"/>')
+        if value:
+            out += (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="{stroke}" '
+                    f'stroke-width="{width}" stroke-linecap="round" '
+                    f'stroke-dasharray="{circ * value / 100:.2f} {circ:.2f}" '
+                    f'transform="rotate(-90 32 32)"/>')
+        return out
+
+    if inner:
+        body = ring(25, 7, step, color, 0.25) + ring(14, 6, inner_step, inner[1], 0.18)
+        dot_r, dot_color = 4.0, color
+    else:
+        body = ring(22, 9, step, color, 0.25)
+        dot_r, dot_color = 7.0, color
+    dot_opacity = 1.0
+    if pulse is not None:
+        # A slow "breath": the dot swells and fades, then settles back.
+        wave = (1 - math.cos(2 * math.pi * pulse / PULSE_FRAMES)) / 2
+        dot_r *= 1 + 0.45 * wave
+        dot_opacity = 1 - 0.35 * wave
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
-           f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="9"/>'
-           f'{arc}<circle cx="32" cy="32" r="7" fill="{color}"/></svg>')
+           f'{body}<circle cx="32" cy="32" r="{dot_r:.2f}" fill="{dot_color}" '
+           f'fill-opacity="{dot_opacity:.2f}"/></svg>')
     os.makedirs(ICON_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(svg)
@@ -609,7 +672,13 @@ def run_indicator(override):
     settings = load_settings()
     state = read_json(STATE_PATH, {"block": None, "alerted": []})
     reader = LogReader()
-    current = {"stats": None, "was_active": None, "shown": None}
+    current = {"stats": None, "was_active": None, "shown": None,
+               "spec": None, "anim": None, "frame": 0}
+
+    tray = None
+    schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
+    if schema and schema.has_key("tray-pos"):
+        tray = Gio.Settings.new(TRAY_SCHEMA)
 
     def save_settings():
         write_json(SETTINGS_PATH, settings)
@@ -701,6 +770,38 @@ def run_indicator(override):
         mi.set_sensitive(False)
         menu.append(mi)
 
+    def set_tray_position(pos):
+        tray.set_string("tray-pos", pos)
+        refresh(force=True)
+
+    def toggle_animate(mi):
+        settings["animate"] = mi.get_active()
+        save_settings()
+        watch_activity()
+
+    def current_icon():
+        if current["anim"]:
+            return icon_path(*current["spec"], pulse=current["frame"])
+        return icon_path(*current["spec"])
+
+    def step_pulse():
+        current["frame"] = (current["frame"] + 1) % PULSE_FRAMES
+        ind.set_icon_full(current_icon(), "Claude usage")
+        return True
+
+    def watch_activity():
+        """Start the pulse while a log was written moments ago; stop it after."""
+        working = (settings["animate"] and current["spec"] is not None
+                   and time.time() - reader.latest_write() < ACTIVE_SECONDS)
+        if working and not current["anim"]:
+            current["frame"] = 0
+            current["anim"] = GLib.timeout_add(PULSE_MS, step_pulse)
+        elif not working and current["anim"]:
+            GLib.source_remove(current["anim"])
+            current["anim"] = None
+            ind.set_icon_full(current_icon(), "Claude usage")
+        return True
+
     def radio_group(menu, choices):
         """choices: [(label, active, callback)]; callbacks fire only on user selection."""
         group = None
@@ -768,6 +869,18 @@ def run_indicator(override):
         radio_group(sub, [(f"{full * 3}{blank * 2}  {key.capitalize()}", settings["bars"] == key,
                            lambda k=key: set_setting("bars", k))
                           for key, (full, blank) in BAR_STYLES.items()])
+        sub.append(Gtk.SeparatorMenuItem())
+        mi = Gtk.CheckMenuItem(label="Animate While Claude Is Working")
+        mi.set_active(settings["animate"])
+        mi.connect("toggled", toggle_animate)
+        sub.append(mi)
+        if tray:
+            sub.append(Gtk.SeparatorMenuItem())
+            header(sub, "POSITION IN TOP BAR")
+            pos = tray.get_string("tray-pos")
+            radio_group(sub, [(label, pos == key, lambda k=key: set_tray_position(k))
+                              for key, label in TRAY_POSITIONS])
+            header(sub, "Moves all tray icons together")
         return sub
 
     def build_customize_menu():
@@ -816,7 +929,8 @@ def run_indicator(override):
             stats = compute(reader)
             current["stats"] = stats
             limit = effective_limit(settings, override)
-            frac, color = gauge(stats, limit, accent_color(settings))
+            frac, color, inner = gauge(stats, limit, accent_color(settings))
+            current["spec"] = (frac, color, inner)
 
             alert = due_alert(stats, limit, settings, state)
             if alert:
@@ -829,13 +943,14 @@ def run_indicator(override):
 
             # Only touch the panel when something visible changed: replacing the
             # menu closes it if it's open, and refreshes are frequent.
-            icon, label = icon_path(frac, color), panel_label(stats, limit, settings["panel"])
+            icon, label = icon_path(frac, color, inner), panel_label(stats, limit, settings["panel"])
             shown = (icon, label, tuple(menu_lines(stats, limit, settings)),
                      json.dumps(settings, sort_keys=True), system_accent(),
+                     tray.get_string("tray-pos") if tray else None,
                      stats["block_active"] and billable(stats["block"]) > 0)
             if force or shown != current["shown"]:
                 current["shown"] = shown
-                ind.set_icon_full(icon, "Claude usage")
+                ind.set_icon_full(current_icon(), "Claude usage")
                 ind.set_label(label, "00000000000")
                 ind.set_menu(build_menu(stats, limit))
         except Exception as e:  # keep the tray alive on parse errors
@@ -850,6 +965,7 @@ def run_indicator(override):
 
     refresh()
     GLib.timeout_add_seconds(REFRESH_SECONDS, refresh)
+    GLib.timeout_add_seconds(2, watch_activity)
     Gtk.main()
 
 
