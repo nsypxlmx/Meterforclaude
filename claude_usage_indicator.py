@@ -684,8 +684,8 @@ def panel_label(stats, limit, settings):
     if not pinned:
         return "", ""
     parts = [text for text in (panel_metric(key, stats, limit) for key, _, _ in pinned) if text]
-    guide = " " + "  ".join(widest for _, _, widest in pinned)
-    return (" " + "  ".join(parts) if parts else " idle"), guide
+    guide = " " + " ".join(widest for _, _, widest in pinned)
+    return (" " + " ".join(parts) if parts else " idle"), guide
 
 
 STALE_AFTER = timedelta(minutes=15)  # plan data older than this gets an "as of" note
