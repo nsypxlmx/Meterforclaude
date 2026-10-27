@@ -1026,7 +1026,7 @@ def run_indicator(override):
     reader = LogReader()
     current = {"stats": None, "was_active": None, "shown": None,
                "spec": None, "anim": None, "frame": 0, "settings_mtime": settings_mtime(),
-               "segments": None, "label": ("", "")}
+               "segments": None, "label": ("", ""), "wide": None}
 
     tray = None
     schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
@@ -1195,6 +1195,13 @@ def run_indicator(override):
                      json.dumps(settings, sort_keys=True), system_accent(),
                      stats["block_active"] and billable(stats["block"]) > 0)
             if force or shown != current["shown"]:
+                wide = bool(segments)
+                if current["wide"] is not None and wide != current["wide"]:
+                    # The AppIndicator extension keeps a wide image's picture and
+                    # width after the icon goes back to a normal one, so switching
+                    # between drawn values and plain text needs a fresh indicator.
+                    os.execv(sys.executable, ["python3", os.path.abspath(__file__)] + sys.argv[1:])
+                current["wide"] = wide
                 current["shown"] = shown
                 current["segments"] = segments or None
                 ind.set_label(*(("", "") if segments else (label, guide)))
