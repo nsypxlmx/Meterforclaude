@@ -76,9 +76,9 @@ PANEL_STYLES = [
     ("icon", "Icon Only"),
 ]
 MENU_SECTIONS = [
-    ("details", "Block Details"),
     ("forecast", "Forecast"),
-    ("history", "Today & Last 7 Days"),
+    ("details", "Details"),
+    ("history", "History"),
     ("cost", "Cost Estimates"),
     ("projects", "Projects"),
     ("models", "Models"),
@@ -327,14 +327,18 @@ class LogReader:
                 state = self.files.get(path)
                 if state is None or state["ino"] != st.st_ino or st.st_size < state["offset"]:
                     state = self.files[path] = {"ino": st.st_ino, "offset": 0, "entries": []}
+                state["mtime"] = st.st_mtime
                 if st.st_size > state["offset"]:
                     self._read_new(path, state)
             except OSError:
                 continue
 
+        # A resumed session copies earlier messages into its new log, rewriting
+        # their cwd. The original log is the one that stopped being written, so
+        # reading logs oldest-written first keeps the original of each message.
         seen = set()
         entries = []
-        for state in self.files.values():
+        for state in sorted(self.files.values(), key=lambda s: s["mtime"]):
             state["entries"] = [e for e in state["entries"] if e[1][0] >= cutoff]
             for key, entry in state["entries"]:
                 if key != (None, None):
@@ -520,9 +524,9 @@ def projection(stats, limit):
     if limit:
         secs = (limit - used) / rate
         if secs < left:
-            return f"At this pace, you'll reach the limit around {clock(now + timedelta(seconds=secs))}"
-        return f"At this pace, you'll end this block at about {int((used + rate * left) * 100 / limit)}%"
-    return f"At this pace, about {fmt(used + rate * left)} by {clock(stats['block_reset'])}"
+            return f"Limit likely around {clock(now + timedelta(seconds=secs))}"
+        return f"On pace for about {int((used + rate * left) * 100 / limit)}% by reset"
+    return f"On pace for about {fmt(used + rate * left)} by {clock(stats['block_reset'])}"
 
 
 def mix(a, b, t):
@@ -618,56 +622,77 @@ def panel_label(stats, limit, style="usage_time"):
     return " " + {"usage": usage, "time": time_left(stats)}.get(style, f"{usage} · {time_left(stats)}")
 
 
+STALE_AFTER = timedelta(minutes=15)  # plan data older than this gets an "as of" note
+
+
 def menu_lines(stats, limit, settings):
-    """Menu rows as (text, style) where style is "main" or "dim"; None is a separator."""
+    """The menu's content: {"main": rows, "submenus": [(title, rows)]}.
+
+    Rows are (text, style) with style "main" or "dim"; None is a separator.
+    The main view keeps only what answers "how much is left?"; everything
+    else sits one level down so the menu stays calm."""
     if stats["empty"]:
-        return [("No Claude Code logs found", "dim")]
+        return {"main": [("No Claude Code logs found", "dim")], "submenus": []}
     show, bars = settings["show"], settings["bars"]
+    plan = stats["plan"]
+    b = stats["block"]
 
     def cost(tk):
         return f"  ·  ≈ {money(tk['usd'])}" if show["cost"] else ""
 
-    plan = stats["plan"]
-    lines = [("CURRENT 5H BLOCK", "dim")]
+    def with_cost_note(rows):
+        if show["cost"] and any(row and "≈" in row[0] for row in rows):
+            note = "≈ is what this would cost at API list prices"
+            if stats["week"]["unpriced"]:
+                note += f"; {fmt(stats['week']['unpriced'])} tokens on unpriced models excluded"
+            rows = rows + [None, (note, "dim")]
+        return rows
+
+    main = []
     if stats["block_active"]:
-        b = stats["block"]
-        lines.append((f"{fmt(billable(b))} tokens  ·  resets {clock(stats['block_reset'])} "
-                      f"(in {time_left(stats)})", "main"))
+        reset = f"resets {clock(stats['block_reset'])}"
         if "five_hour" in plan:
-            lines.append((f"{bar(budget_frac(stats, limit), bars)}  "
-                          f"{used_pct(stats, limit)}% of your 5-hour limit", "main"))
+            main.append((f"{bar(budget_frac(stats, limit), bars)}  "
+                         f"{used_pct(stats, limit)}% of 5-hour limit  ·  {reset}", "main"))
         elif limit:
-            lines.append((f"{bar(budget_frac(stats, limit), bars)}  "
-                          f"{used_pct(stats, limit)}% of {fmt(limit)} limit", "main"))
+            main.append((f"{bar(budget_frac(stats, limit), bars)}  "
+                         f"{used_pct(stats, limit)}% of {fmt(limit)} limit  ·  {reset}", "main"))
+        else:
+            main.append((f"{bar(block_elapsed(stats), bars)}  "
+                         f"{fmt(billable(b))} tokens  ·  {reset}", "main"))
+    else:
+        main.append(("No active block, starts with your next message", "main"))
     if "seven_day" in plan:
         weekly = plan["seven_day"]
-        lines.append((f"{bar(weekly['pct'] / 100, bars)}  {weekly['pct']:.0f}% of your weekly limit  ·  "
-                      f"resets {weekly['reset'].astimezone():%a %H:%M}", "main"))
-    if stats["block_active"]:
+        main.append((f"{bar(weekly['pct'] / 100, bars)}  {weekly['pct']:.0f}% of weekly limit  ·  "
+                     f"resets {weekly['reset'].astimezone():%a %H:%M}", "main"))
+    forecast = projection(stats, limit) if show["forecast"] else None
+    if forecast:
+        main.append((forecast, "main"))
+    if plan and datetime.now(timezone.utc) - plan["updated"] > STALE_AFTER:
+        main.append((f"Plan limits as of {clock(plan['updated'])}", "dim"))
+
+    submenus = []
+    if show["details"] and stats["block_active"]:
         elapsed = block_elapsed(stats)
-        lines.append((f"{bar(elapsed, bars)}  {int(elapsed * 100)}% of block time passed", "main"))
-        forecast = projection(stats, limit) if show["forecast"] else None
-        if forecast:
-            lines.append((forecast, "main"))
-        if show["details"]:
-            lines.append((f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  "
-                          f"cache {fmt(b['cw'] + b['cr'])}{cost(b)}", "dim"))
-        if not has_limit(stats, limit) and settings["limit_mode"] == "auto":
-            lines.append(("Hit your limit? Choose Mark Limit Reached to calibrate", "dim"))
-    else:
-        lines.append(("No active block, starts with your next message", "main"))
-    if plan:
-        lines.append((f"Plan limits from Claude Code  ·  updated {clock(plan['updated'])}", "dim"))
+        rows = [("THIS BLOCK", "dim"),
+                (f"{fmt(billable(b))} tokens{cost(b)}", "main"),
+                (f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  cache {fmt(b['cw'] + b['cr'])}", "dim"),
+                (f"{bar(elapsed, bars)}  {int(elapsed * 100)}% of block time passed  ·  "
+                 f"{time_left(stats)} left", "main")]
+        if plan:
+            rows.append((f"Plan limits from Claude Code, updated {clock(plan['updated'])}", "dim"))
+        submenus.append(("Details", with_cost_note(rows)))
 
     if show["history"]:
-        lines += [None, ("TODAY & LAST 7 DAYS", "dim")]
-        lines.append((f"Today  {fmt(billable(stats['today']))}{cost(stats['today'])}", "main"))
         values = [n for _, n in stats["days"]]
-        lines.append((f"{spark(values)}  {fmt(sum(values))} in 7 days{cost(stats['week'])}", "main"))
+        rows = [(f"Today  {fmt(billable(stats['today']))}{cost(stats['today'])}", "main"),
+                (f"{spark(values)}  {fmt(sum(values))} in 7 days{cost(stats['week'])}", "main")]
         peak_day, peak = max(stats["days"], key=lambda d: d[1])
         if peak:
-            lines.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
-                          f"cache reads {fmt(stats['week']['cr'])}", "dim"))
+            rows.append((f"Peak {peak_day.strftime('%a')} {fmt(peak)}  ·  "
+                         f"cache reads {fmt(stats['week']['cr'])}", "dim"))
+        submenus.append(("History", with_cost_note(rows)))
 
     def breakdown(kind, by_key, label, single, top):
         """Ranked share rows for one period; a lone entry collapses to one line."""
@@ -675,36 +700,30 @@ def menu_lines(stats, limit, settings):
         items = {k: tk for k, tk in by_key.get(scope, {}).items() if billable(tk)}
         if not items:
             return
-        title = dict(SCOPES).get(scope, "This Block").upper()
-        lines.extend([None, (f"{title} BY {kind[:-1].upper()}", "dim")])
+        rows = [(dict(SCOPES).get(scope, "This Block").upper(), "dim")]
         ranked = sorted(items.items(), key=lambda x: -billable(x[1]))
         if len(ranked) == 1:
             key, tk = ranked[0]
-            lines.append((f"{single} {label(key)}  ·  {fmt(billable(tk))}{cost(tk)}", "main"))
-            return
-        total = sum(billable(tk) for _, tk in ranked)
-        rows = [(label(key), tk) for key, tk in ranked[:top]]
-        if len(ranked) > top:
-            rest = empty()
-            for _, tk in ranked[top:]:
-                add(rest, tk)
-            rows.append((f"{len(ranked) - top} more", rest))
-        for name, tk in rows:
-            share = billable(tk) / total
-            lines.append((f"{bar(share, bars, width=8)}  {name}  {share * 100:.0f}%  ·  "
-                          f"{fmt(billable(tk))}{cost(tk)}", "main"))
+            rows.append((f"{single} {label(key)}  ·  {fmt(billable(tk))}{cost(tk)}", "main"))
+        else:
+            total = sum(billable(tk) for _, tk in ranked)
+            shown = [(label(key), tk) for key, tk in ranked[:top]]
+            if len(ranked) > top:
+                rest = empty()
+                for _, tk in ranked[top:]:
+                    add(rest, tk)
+                shown.append((f"{len(ranked) - top} more", rest))
+            for name, tk in shown:
+                share = billable(tk) / total
+                rows.append((f"{bar(share, bars, width=8)}  {name}  {share * 100:.0f}%  ·  "
+                             f"{fmt(billable(tk))}{cost(tk)}", "main"))
+        submenus.append((kind.capitalize(), with_cost_note(rows)))
 
     if show["projects"]:
         breakdown("projects", stats["projects"], str, "All in", top=5)
     if show["models"]:
         breakdown("models", stats["models"], model_name, "All on", top=4)
-
-    if show["cost"] and any(line and "≈" in line[0] for line in lines):
-        note = "≈ is what this usage would cost at API list prices"
-        if stats["week"]["unpriced"]:
-            note += f"; {fmt(stats['week']['unpriced'])} tokens on unpriced models not included"
-        lines.append((note, "dim"))
-    return lines
+    return {"main": main, "submenus": submenus}
 
 
 def alert_label(levels):
@@ -733,7 +752,7 @@ def due_alerts(stats, limit, settings, state):
         if crossed(pct, settings["alerts"], state, "block", stats["block_start"].isoformat()):
             body = f"Resets at {clock(stats['block_reset'])}, in {time_left(stats)}."
             forecast = projection(stats, limit)
-            if forecast and forecast.startswith("At this pace"):
+            if forecast and forecast.startswith(("Limit likely", "On pace")):
                 body = f"{forecast}. {body}"
             title = "5-hour limit" if "five_hour" in plan else "Claude usage"
             alerts.append((f"{title} at {pct}%", body))
@@ -752,8 +771,16 @@ def run_once(override):
     limit = plan_limit(s) if "five_hour" in s["plan"] else effective_limit(settings, override)
     print(panel_label(s, limit, settings["panel"]).strip() or "(icon only)")
     print()
-    for line in menu_lines(s, limit, settings):
-        print("  ──" if line is None else ("  " if line[1] == "dim" else "") + line[0])
+    content = menu_lines(s, limit, settings)
+
+    def show_rows(rows, indent):
+        for row in rows:
+            print(indent + ("──" if row is None else ("  " if row[1] == "dim" else "") + row[0]))
+
+    show_rows(content["main"], "")
+    for title, rows in content["submenus"]:
+        print(f"\n{title} ▸")
+        show_rows(rows, "    ")
 
 
 def run_indicator(override):
@@ -1021,24 +1048,45 @@ def run_indicator(override):
             menu.append(mi)
             return mi
 
-        for line in menu_lines(stats, limit, settings):
-            if line is None:
-                menu.append(Gtk.SeparatorMenuItem())
-            else:
-                item(line[0], dim=line[1] == "dim")
+        def fill(target, rows):
+            for row in rows:
+                if row is None:
+                    target.append(Gtk.SeparatorMenuItem())
+                    continue
+                mi = Gtk.MenuItem(label=row[0])
+                mi.set_sensitive(row[1] != "dim")
+                target.append(mi)
+
+        content = menu_lines(stats, limit, settings)
+        fill(menu, content["main"])
+        if content["submenus"]:
+            menu.append(Gtk.SeparatorMenuItem())
+            for title, rows in content["submenus"]:
+                sub = Gtk.Menu()
+                fill(sub, rows)
+                item(title).set_submenu(sub)
         menu.append(Gtk.SeparatorMenuItem())
         if (stats["block_active"] and billable(stats["block"]) and not override
                 and "five_hour" not in stats["plan"]):
             item("Mark Limit Reached", mark_limit_reached)
-        item("Limit").set_submenu(build_limit_menu())
-        item("Alerts").set_submenu(build_alerts_menu())
-        item("Appearance").set_submenu(build_appearance_menu())
-        item("Customize Menu").set_submenu(build_customize_menu())
-        menu.append(Gtk.SeparatorMenuItem())
-        item("Refresh Now", lambda _: refresh(force=True))
+        item("Settings").set_submenu(build_settings_menu())
         item("Quit Claude Usage", lambda _: Gtk.main_quit())
         menu.show_all()
         return menu
+
+    def build_settings_menu():
+        sub = Gtk.Menu()
+        for title, build in (("Limit", build_limit_menu), ("Alerts", build_alerts_menu),
+                             ("Appearance", build_appearance_menu),
+                             ("Customize Menu", build_customize_menu)):
+            mi = Gtk.MenuItem(label=title)
+            mi.set_submenu(build())
+            sub.append(mi)
+        sub.append(Gtk.SeparatorMenuItem())
+        mi = Gtk.MenuItem(label="Refresh Now")
+        mi.connect("activate", lambda _: refresh(force=True))
+        sub.append(mi)
+        return sub
 
     def refresh(force=False):
         try:
@@ -1064,7 +1112,7 @@ def run_indicator(override):
             # Only touch the panel when something visible changed: replacing the
             # menu closes it if it's open, and refreshes are frequent.
             icon, label = icon_path(frac, color, inner), panel_label(stats, limit, settings["panel"])
-            shown = (icon, label, tuple(menu_lines(stats, limit, settings)),
+            shown = (icon, label, repr(menu_lines(stats, limit, settings)),
                      json.dumps(settings, sort_keys=True), system_accent(),
                      tray.get_string("tray-pos") if tray else None,
                      stats["block_active"] and billable(stats["block"]) > 0)
