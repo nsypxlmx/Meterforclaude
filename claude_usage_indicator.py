@@ -697,7 +697,7 @@ def panel_segments(stats, limit, settings):
 
 PANEL_ICON_PX = 16      # the top bar's icon height in logical pixels
 LABEL_OPACITY = 0.55    # "5h", "7d" and "↻" next to their bright numbers
-TEXT_SCALE = 0.86       # drawn text reads larger than the panel's own; this matches it
+TEXT_SCALE = 0.78       # drawn text reads larger than the panel's own; this matches it
 MAX_PANEL_ICONS = 60    # drawn top-bar images kept in the cache
 
 
