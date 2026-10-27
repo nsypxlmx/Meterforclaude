@@ -76,7 +76,7 @@ BAR_STYLES = {
 PANEL_METRICS = [
     ("five_hour", "5-Hour Limit", "5h 99%"),
     ("weekly", "Weekly Limit", "7d 99%"),
-    ("time", "Time Until Reset", "↻ 0h00m"),
+    ("time", "Time Until Reset", "↻0h00m"),
     ("tokens", "Tokens This Block", "000.0K"),
     ("cost", "Cost Today", "$000.00"),
 ]
@@ -669,7 +669,7 @@ def panel_metric(key, stats, limit):
     if key == "weekly" and "seven_day" in plan:
         return f"7d {pad(f'{round(plan['seven_day']['pct'])}%', 3)}"
     if key == "time" and active:
-        return f"↻ {time_left(stats)}"
+        return f"↻{time_left(stats)}"
     if key == "tokens" and active:
         return pad(fmt(billable(stats["block"])), 6)
     if key == "cost":
