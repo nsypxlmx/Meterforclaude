@@ -32,6 +32,8 @@ PROJECT_DIRS = [
 ]
 ICON_DIR = os.path.expanduser("~/.cache/claude-usage")
 STATE_PATH = os.path.join(ICON_DIR, "state.json")
+# Written by claude_usage_statusline.py with the plan limits Claude Code reports.
+LIMITS_PATH = os.path.join(ICON_DIR, "limits.json")
 SETTINGS_PATH = os.path.expanduser("~/.config/claude-usage/settings.json")
 BLOCK_HOURS = 5
 REFRESH_SECONDS = 15
@@ -348,7 +350,27 @@ def empty():
     return {"in": 0, "out": 0, "cw": 0, "cr": 0, "usd": 0.0, "unpriced": 0}
 
 
-def compute(reader=None):
+def load_plan_limits():
+    """Real plan usage from the status line bridge, without windows that have reset.
+
+    Returns {"five_hour": {"pct", "reset"}, "seven_day": {...}, "updated"}; any
+    window may be missing, and the dict is empty when there's nothing current."""
+    data = read_json(LIMITS_PATH, {})
+    now = time.time()
+    plan = {}
+    for key in ("five_hour", "seven_day"):
+        window = data.get(key)
+        if (isinstance(window, dict) and window.get("used_percentage") is not None
+                and (window.get("resets_at") or 0) > now):
+            plan[key] = {"pct": float(window["used_percentage"]),
+                         "reset": datetime.fromtimestamp(window["resets_at"], timezone.utc)}
+    if plan:
+        plan["updated"] = datetime.fromtimestamp(data.get("updated", now), timezone.utc)
+    return plan
+
+
+def compute(reader=None, plan=None):
+    plan = plan or {}
     entries = (reader or LogReader()).entries()
     now = datetime.now(timezone.utc)
     local_today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -362,6 +384,9 @@ def compute(reader=None):
         if block_start is None or t >= block_start + timedelta(hours=BLOCK_HOURS):
             block_start = t.replace(minute=0, second=0, microsecond=0)
     block_active = block_start is not None and now < block_start + timedelta(hours=BLOCK_HOURS)
+    if "five_hour" in plan:  # the plan's real window replaces the guess
+        block_start = plan["five_hour"]["reset"] - timedelta(hours=BLOCK_HOURS)
+        block_active = True
 
     block, today, week = empty(), empty(), empty()
     days = [0] * 7
@@ -390,7 +415,8 @@ def compute(reader=None):
         "block_active": block_active,
         "block_start": block_start if block_active else None,
         "block_reset": (block_start + timedelta(hours=BLOCK_HOURS)) if block_active else None,
-        "empty": not entries,
+        "empty": not entries and not plan,
+        "plan": plan,
     }
 
 
@@ -432,11 +458,26 @@ def block_elapsed(stats):
     return min(passed / timedelta(hours=BLOCK_HOURS), 1.0)
 
 
+def plan_limit(stats):
+    """Tokens per window implied by the plan's 5-hour percentage, or 0 if it's too early to tell."""
+    pct = stats["plan"]["five_hour"]["pct"]
+    used = billable(stats["block"])
+    return int(used * 100 / pct) if pct >= 1 and used else 0
+
+
+def has_limit(stats, limit):
+    return bool(limit) or "five_hour" in stats["plan"]
+
+
 def used_pct(stats, limit):
+    if "five_hour" in stats["plan"]:
+        return round(stats["plan"]["five_hour"]["pct"])
     return billable(stats["block"]) * 100 // limit
 
 
 def budget_frac(stats, limit):
+    if "five_hour" in stats["plan"]:
+        return min(stats["plan"]["five_hour"]["pct"] / 100, 1.0)
     return min(billable(stats["block"]) / limit, 1.0)
 
 
@@ -483,13 +524,20 @@ def status_color(frac):
 def gauge(stats, limit, accent):
     """Ring spec for the panel icon: (fraction, hex color, inner ring or None).
 
-    With a limit, the outer ring is usage and the inner ring is block time,
+    With a limit, the outer ring is usage. The inner ring is the weekly limit
+    when the plan reports it (colored once it passes half), otherwise block time,
     so usage running ahead of the clock is visible at a glance."""
     if not stats["block_active"]:
         return 0.0, COLORS["idle"], None
-    if limit:
+    if has_limit(stats, limit):
         frac = budget_frac(stats, limit)
-        return frac, status_color(frac), (block_elapsed(stats), accent)
+        weekly = stats["plan"].get("seven_day")
+        if weekly:
+            wfrac = min(weekly["pct"] / 100, 1.0)
+            inner = (wfrac, status_color(wfrac) if wfrac >= 0.5 else accent)
+        else:
+            inner = (block_elapsed(stats), accent)
+        return frac, status_color(frac), inner
     return block_elapsed(stats), accent, None
 
 
@@ -545,7 +593,7 @@ def panel_label(stats, limit, style="usage_time"):
         return ""
     if not stats["block_active"]:
         return " idle"
-    usage = f"{used_pct(stats, limit)}%" if limit else fmt(billable(stats["block"]))
+    usage = f"{used_pct(stats, limit)}%" if has_limit(stats, limit) else fmt(billable(stats["block"]))
     return " " + {"usage": usage, "time": time_left(stats)}.get(style, f"{usage} · {time_left(stats)}")
 
 
@@ -558,14 +606,23 @@ def menu_lines(stats, limit, settings):
     def cost(tk):
         return f"  ·  ≈ {money(tk['usd'])}" if show["cost"] else ""
 
+    plan = stats["plan"]
     lines = [("CURRENT 5H BLOCK", "dim")]
     if stats["block_active"]:
         b = stats["block"]
         lines.append((f"{fmt(billable(b))} tokens  ·  resets {clock(stats['block_reset'])} "
                       f"(in {time_left(stats)})", "main"))
-        if limit:
+        if "five_hour" in plan:
+            lines.append((f"{bar(budget_frac(stats, limit), bars)}  "
+                          f"{used_pct(stats, limit)}% of your 5-hour limit", "main"))
+        elif limit:
             lines.append((f"{bar(budget_frac(stats, limit), bars)}  "
                           f"{used_pct(stats, limit)}% of {fmt(limit)} limit", "main"))
+    if "seven_day" in plan:
+        weekly = plan["seven_day"]
+        lines.append((f"{bar(weekly['pct'] / 100, bars)}  {weekly['pct']:.0f}% of your weekly limit  ·  "
+                      f"resets {weekly['reset'].astimezone():%a %H:%M}", "main"))
+    if stats["block_active"]:
         elapsed = block_elapsed(stats)
         lines.append((f"{bar(elapsed, bars)}  {int(elapsed * 100)}% of block time passed", "main"))
         forecast = projection(stats, limit) if show["forecast"] else None
@@ -574,10 +631,12 @@ def menu_lines(stats, limit, settings):
         if show["details"]:
             lines.append((f"out {fmt(b['out'])}  ·  in {fmt(b['in'])}  ·  "
                           f"cache {fmt(b['cw'] + b['cr'])}{cost(b)}", "dim"))
-        if not limit and settings["limit_mode"] == "auto":
+        if not has_limit(stats, limit) and settings["limit_mode"] == "auto":
             lines.append(("Hit your limit? Choose Mark Limit Reached to calibrate", "dim"))
     else:
         lines.append(("No active block, starts with your next message", "main"))
+    if plan:
+        lines.append((f"Plan limits from Claude Code  ·  updated {clock(plan['updated'])}", "dim"))
 
     if show["history"]:
         lines += [None, ("TODAY & LAST 7 DAYS", "dim")]
@@ -621,30 +680,43 @@ def alert_label(levels):
     return "At " + " and ".join(f"{lvl}%" for lvl in levels)
 
 
-def due_alert(stats, limit, settings, state):
-    """Return (title, body) for the highest newly crossed threshold, updating state."""
-    if not (stats["block_active"] and limit):
-        return None
-    block_id = stats["block_start"].isoformat()
-    if state.get("block") != block_id:
-        state.clear()
-        state.update({"block": block_id, "alerted": []})
-    pct = used_pct(stats, limit)
-    due = [lvl for lvl in settings["alerts"] if pct >= lvl and lvl not in state["alerted"]]
-    if not due:
-        return None
-    state["alerted"] += due
-    body = f"Resets at {clock(stats['block_reset'])}, in {time_left(stats)}."
-    forecast = projection(stats, limit)
-    if forecast and forecast.startswith("At this pace"):
-        body = f"{forecast}. {body}"
-    return f"Claude usage at {pct}%", body
+def crossed(pct, levels, state, window_key, window_id):
+    """Thresholds newly crossed in this window; records them in state."""
+    if state.get(window_key) != window_id or window_key + "_alerted" not in state:
+        state[window_key] = window_id
+        state[window_key + "_alerted"] = []
+    done = state[window_key + "_alerted"]
+    due = [lvl for lvl in levels if pct >= lvl and lvl not in done]
+    done += due
+    return due
+
+
+def due_alerts(stats, limit, settings, state):
+    """[(title, body)] for thresholds newly crossed in the 5-hour and weekly windows."""
+    alerts = []
+    plan = stats["plan"]
+    if stats["block_active"] and has_limit(stats, limit):
+        pct = used_pct(stats, limit)
+        if crossed(pct, settings["alerts"], state, "block", stats["block_start"].isoformat()):
+            body = f"Resets at {clock(stats['block_reset'])}, in {time_left(stats)}."
+            forecast = projection(stats, limit)
+            if forecast and forecast.startswith("At this pace"):
+                body = f"{forecast}. {body}"
+            title = "5-hour limit" if "five_hour" in plan else "Claude usage"
+            alerts.append((f"{title} at {pct}%", body))
+    weekly = plan.get("seven_day")
+    if weekly:
+        pct = round(weekly["pct"])
+        if crossed(pct, settings["alerts"], state, "week", weekly["reset"].isoformat()):
+            alerts.append((f"Weekly limit at {pct}%",
+                           f"Resets {weekly['reset'].astimezone():%A at %H:%M}."))
+    return alerts
 
 
 def run_once(override):
     settings = load_settings()
-    limit = effective_limit(settings, override)
-    s = compute()
+    s = compute(plan=load_plan_limits())
+    limit = plan_limit(s) if "five_hour" in s["plan"] else effective_limit(settings, override)
     print(panel_label(s, limit, settings["panel"]).strip() or "(icon only)")
     print()
     for line in menu_lines(s, limit, settings):
@@ -670,7 +742,7 @@ def run_indicator(override):
     ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
 
     settings = load_settings()
-    state = read_json(STATE_PATH, {"block": None, "alerted": []})
+    state = read_json(STATE_PATH, {})
     reader = LogReader()
     current = {"stats": None, "was_active": None, "shown": None,
                "spec": None, "anim": None, "frame": 0}
@@ -700,7 +772,7 @@ def run_indicator(override):
         settings["limit_mode"] = "auto"
         save_settings()
         # The block is at its limit by definition; don't follow up with threshold alerts.
-        state.update({"block": block_id, "alerted": list(settings["alerts"])})
+        state.update({"block": block_id, "block_alerted": list(settings["alerts"])})
         write_json(STATE_PATH, state)
         count = min(len(settings["hits"]), LEARN_FROM)
         notify("Limit learned",
@@ -815,6 +887,10 @@ def run_indicator(override):
     def build_limit_menu():
         sub = Gtk.Menu()
         learned = learned_limit(settings)
+        if current["stats"] and "five_hour" in current["stats"]["plan"]:
+            header(sub, "Using your plan's real limits")
+            sub.append(Gtk.SeparatorMenuItem())
+            header(sub, "WHEN PLAN DATA IS UNAVAILABLE")
         if override:
             mi = Gtk.MenuItem(label=f"Set by --limit to {fmt(override)}")
             mi.set_sensitive(False)
@@ -912,7 +988,8 @@ def run_indicator(override):
             else:
                 item(line[0], dim=line[1] == "dim")
         menu.append(Gtk.SeparatorMenuItem())
-        if stats["block_active"] and billable(stats["block"]) and not override:
+        if (stats["block_active"] and billable(stats["block"]) and not override
+                and "five_hour" not in stats["plan"]):
             item("Mark Limit Reached", mark_limit_reached)
         item("Limit").set_submenu(build_limit_menu())
         item("Alerts").set_submenu(build_alerts_menu())
@@ -926,15 +1003,19 @@ def run_indicator(override):
 
     def refresh(force=False):
         try:
-            stats = compute(reader)
+            stats = compute(reader, load_plan_limits())
             current["stats"] = stats
-            limit = effective_limit(settings, override)
+            if "five_hour" in stats["plan"]:
+                limit = plan_limit(stats)
+            else:
+                limit = effective_limit(settings, override)
             frac, color, inner = gauge(stats, limit, accent_color(settings))
             current["spec"] = (frac, color, inner)
 
-            alert = due_alert(stats, limit, settings, state)
-            if alert:
+            alerts = due_alerts(stats, limit, settings, state)
+            if alerts:
                 write_json(STATE_PATH, state)
+            for alert in alerts:
                 notify(*alert, frac=frac, color=color)
             if current["was_active"] and not stats["block_active"] and settings["reset_alert"]:
                 notify("Your 5-hour block has ended",
