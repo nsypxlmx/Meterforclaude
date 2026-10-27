@@ -40,7 +40,8 @@ STATE_PATH = os.path.join(ICON_DIR, "state.json")
 LIMITS_PATH = os.path.join(ICON_DIR, "limits.json")
 SETTINGS_PATH = os.path.expanduser("~/.config/claude-usage/settings.json")
 BLOCK_HOURS = 5
-REFRESH_SECONDS = 15
+WATCH_SECONDS = 2      # how often the tray checks (a few stat calls) whether anything changed
+SAFETY_REFRESH = 300   # full refresh at least this often, in seconds, in case a change was missed
 HISTORY_DAYS = 8
 RATE_WINDOW = timedelta(minutes=30)
 LEARN_FROM = 5  # most recent marked blocks used for the learned limit
@@ -141,8 +142,8 @@ DEFAULT_SETTINGS = {
 TRAY_SCHEMA = "org.gnome.shell.extensions.appindicator"
 TRAY_POSITIONS = [("left", "Left"), ("center", "Center"), ("right", "Right")]
 ACTIVE_SECONDS = 12   # a log written this recently means Claude is mid-reply
-PULSE_FRAMES = 8
-PULSE_MS = 140
+PULSE_FRAMES = 6
+PULSE_MS = 250   # each frame is a new image the shell has to load; keep it slow
 
 
 def fmt(n):
@@ -345,6 +346,19 @@ class LogReader:
             except OSError:
                 pass
         return latest
+
+    def signature(self):
+        """Changes whenever a tracked log is written or a session log is added.
+        A handful of stat calls, so it's cheap to check every couple of seconds."""
+        dirs = []
+        for d in PROJECT_DIRS:
+            try:
+                dirs.append(os.stat(d).st_mtime)
+                with os.scandir(d) as it:
+                    dirs += [e.stat().st_mtime for e in it if e.is_dir()]
+            except OSError:
+                pass
+        return self.latest_write(), max(dirs, default=0)
 
     def entries(self):
         """Return sorted (datetime_utc, model, tokens_dict, project), deduplicated."""
@@ -1026,7 +1040,8 @@ def run_indicator(override):
     reader = LogReader()
     current = {"stats": None, "was_active": None, "shown": None,
                "spec": None, "anim": None, "frame": 0, "settings_mtime": settings_mtime(),
-               "segments": None, "label": ("", ""), "wide": None}
+               "segments": None, "label": ("", ""), "wide": None,
+               "seen": None, "refreshed": 0.0}
 
     tray = None
     schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
@@ -1075,12 +1090,16 @@ def run_indicator(override):
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--settings"],
                          start_new_session=True)
 
+    @functools.lru_cache(maxsize=2 * PULSE_FRAMES)
+    def drawn_icon(spec, segments, pulse, text_size):
+        return panel_icon_path(*spec, list(segments), pulse, text_size)
+
     def current_icon():
         pulse = current["frame"] if current["anim"] else None
         if current["segments"]:
             try:
-                return panel_icon_path(*current["spec"], current["segments"], pulse,
-                                       settings["text_size"])
+                return drawn_icon(current["spec"], tuple(current["segments"]), pulse,
+                                  settings["text_size"])
             except Exception as e:  # fall back to the plain text label
                 print("draw error:", e, file=sys.stderr)
                 current["segments"] = None
@@ -1093,26 +1112,83 @@ def run_indicator(override):
         return True
 
     def watch():
-        """Every 2s: pick up edits from the settings window, and pulse the
-        icon while a log was written moments ago."""
+        """Every couple of seconds, a few stat calls decide whether a refresh is
+        needed: a log was written, the plan limits or settings changed, or the
+        minute turned (the time left is shown to the minute). Otherwise nothing
+        is read or drawn. While the screen is locked nothing runs at all."""
+        if power["locked"]:
+            stop_pulse()
+            return True
         mtime = settings_mtime()
         if mtime != current["settings_mtime"]:
             current["settings_mtime"] = mtime
             settings.clear()
             settings.update(load_settings())
+            current["seen"] = None
+        try:
+            limits_mtime = os.stat(LIMITS_PATH).st_mtime
+        except OSError:
+            limits_mtime = 0
+        now = time.time()
+        seen = (reader.signature(), limits_mtime, int(now // 60))
+        if seen != current["seen"] or now - current["refreshed"] > SAFETY_REFRESH:
+            current["seen"] = seen
             refresh()
-        working = (settings["animate"] and current["spec"] is not None
-                   and time.time() - reader.latest_write() < ACTIVE_SECONDS)
+        working = (settings["animate"] and not power["saving"] and current["spec"] is not None
+                   and now - reader.latest_write() < ACTIVE_SECONDS)
         if working and not current["anim"]:
             current["frame"] = 0
             current["anim"] = GLib.timeout_add(PULSE_MS, step_pulse)
-        elif not working and current["anim"]:
+        elif not working:
+            stop_pulse()
+        return True
+
+    def stop_pulse():
+        if current["anim"]:
             GLib.source_remove(current["anim"])
             current["anim"] = None
             ind.set_icon_full(current_icon(), "Claude usage")
-        return True
 
-    def build_menu(stats, limit):
+    # Battery, Power Saver and the lock screen, followed over D-Bus.
+    power = {"battery": False, "profile": "", "locked": False, "saving": False}
+
+    def watch_proxy(name, path, iface, on_change, bus=Gio.BusType.SYSTEM):
+        try:
+            proxy = Gio.DBusProxy.new_for_bus_sync(bus, Gio.DBusProxyFlags.NONE, None,
+                                                   name, path, iface, None)
+        except GLib.Error:
+            return None
+        proxy.connect("g-properties-changed", lambda *_: on_change(proxy))
+        on_change(proxy)
+        return proxy
+
+    def power_changed(proxy=None):
+        for key, prop in (("battery", "OnBattery"), ("profile", "ActiveProfile")):
+            if proxy is not None and proxy.get_cached_property(prop) is not None:
+                power[key] = proxy.get_cached_property(prop).unpack()
+        power["saving"] = power["battery"] or power["profile"] == "power-saver"
+
+    proxies = [watch_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower",
+                           "org.freedesktop.UPower", power_changed),
+               watch_proxy("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles",
+                           "net.hadess.PowerProfiles", power_changed)]
+
+    def lock_changed(_proxy, _sender, signal, params):
+        if signal == "ActiveChanged":
+            power["locked"] = params.unpack()[0]
+            if not power["locked"]:
+                current["seen"] = None   # catch up right away on unlock
+
+    try:
+        screensaver = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
+            "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver", None)
+        screensaver.connect("g-signal", lock_changed)
+        proxies.append(screensaver)
+    except GLib.Error:
+        pass
+
+    def build_menu(stats, limit, content):
         menu = Gtk.Menu()
 
         def fill(target, rows):
@@ -1145,7 +1221,6 @@ def run_indicator(override):
             menu.append(mi)
             return mi
 
-        content = menu_lines(stats, limit, settings)
         fill(menu, content["main"])
         if content["submenus"]:
             menu.append(Gtk.SeparatorMenuItem())
@@ -1166,6 +1241,7 @@ def run_indicator(override):
         return menu
 
     def refresh(force=False):
+        current["refreshed"] = time.time()
         try:
             stats = compute(reader, load_plan_limits())
             current["stats"] = stats
@@ -1191,7 +1267,8 @@ def run_indicator(override):
             segments = panel_segments(stats, limit, settings) if settings["draw_values"] else []
             if segments:
                 icon = repr(segments)
-            shown = (icon, label, repr(menu_lines(stats, limit, settings)),
+            content = menu_lines(stats, limit, settings)
+            shown = (icon, label, repr(content),
                      json.dumps(settings, sort_keys=True), system_accent(),
                      stats["block_active"] and billable(stats["block"]) > 0)
             if force or shown != current["shown"]:
@@ -1206,7 +1283,7 @@ def run_indicator(override):
                 current["segments"] = segments or None
                 ind.set_label(*(("", "") if segments else (label, guide)))
                 ind.set_icon_full(current_icon(), "Claude usage")
-                ind.set_menu(build_menu(stats, limit))
+                ind.set_menu(build_menu(stats, limit, content))
         except Exception as e:  # keep the tray alive on parse errors
             ind.set_label(" err", "")
             print("refresh error:", e, file=sys.stderr)
@@ -1218,8 +1295,8 @@ def run_indicator(override):
         interface.connect("changed::accent-color", lambda *_: refresh())
 
     refresh()
-    GLib.timeout_add_seconds(REFRESH_SECONDS, refresh)
-    GLib.timeout_add_seconds(2, watch)
+    # Seconds-based timers let GLib batch wakeups with other processes.
+    GLib.timeout_add_seconds(WATCH_SECONDS, watch)
     Gtk.main()
 
 
@@ -1335,7 +1412,8 @@ def run_settings():
                           "Symbolic matches the other top-bar icons and turns amber and red near a limit"),
                 accent_row,
                 switch_row("Animate While Claude Is Working", s["animate"],
-                           lambda on: update_settings(animate=on)),
+                           lambda on: update_settings(animate=on),
+                           "Pauses on battery and in Power Saver"),
             ]),
         ]
         if tray:
