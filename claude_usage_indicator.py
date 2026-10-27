@@ -130,6 +130,7 @@ DEFAULT_SETTINGS = {
     "accent": "system",     # "system" or a key of ACCENTS; used by the color style
     "pinned": ["five_hour", "time"],  # keys of PANEL_METRICS shown in the top bar
     "draw_values": True,    # draw pinned values into the icon, labels dimmer than numbers
+    "text_size": 70,        # drawn text, as a % of the panel font (it reads larger when drawn)
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
     "animate": True,        # pulse the ring's center while Claude is writing
@@ -697,7 +698,7 @@ def panel_segments(stats, limit, settings):
 
 PANEL_ICON_PX = 16      # the top bar's icon height in logical pixels
 LABEL_OPACITY = 0.55    # "5h", "7d" and "↻" next to their bright numbers
-TEXT_SCALE = 0.78       # drawn text reads larger than the panel's own; this matches it
+TEXT_SIZES = (40, 100)  # range of the Text Size slider, in %
 MAX_PANEL_ICONS = 60    # drawn top-bar images kept in the cache
 
 
@@ -716,7 +717,7 @@ def panel_font():
     return desc.get_family() or "Sans", 700, size * interface.get_double("text-scaling-factor")
 
 
-def panel_icon_path(frac, color, inner, segments, pulse=None):
+def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=70):
     """The ring with the pinned values drawn beside it, as one wide SVG.
 
     Tray labels are plain text in a single color; drawing the values ourselves
@@ -735,7 +736,7 @@ def panel_icon_path(frac, color, inner, segments, pulse=None):
     desc = Pango.FontDescription()
     desc.set_family(family)
     desc.set_weight(Pango.Weight(weight))
-    desc.set_absolute_size(px * TEXT_SCALE * unit * Pango.SCALE)
+    desc.set_absolute_size(px * text_size / 100 * unit * Pango.SCALE)
 
     def layout(ctx, text):
         lay = PangoCairo.create_layout(ctx)
@@ -1056,7 +1057,8 @@ def run_indicator(override):
         pulse = current["frame"] if current["anim"] else None
         if current["segments"]:
             try:
-                return panel_icon_path(*current["spec"], current["segments"], pulse)
+                return panel_icon_path(*current["spec"], current["segments"], pulse,
+                                       settings["text_size"])
             except Exception as e:  # fall back to the plain text label
                 print("draw error:", e, file=sys.stderr)
                 current["segments"] = None
@@ -1190,7 +1192,7 @@ def run_settings():
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gio, Gtk
+    from gi.repository import Adw, Gio, GLib, Gtk
 
     tray = None
     schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
@@ -1241,6 +1243,34 @@ def run_settings():
         s = load_settings()
         toasts = Adw.ToastOverlay()
 
+        # Text Size: saved a moment after the slider stops, not on every step.
+        size_row = Adw.ActionRow(title="Text Size")
+        size_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, *TEXT_SIZES, 1)
+        size_scale.set_value(s["text_size"])
+        size_scale.set_hexpand(True)
+        size_scale.set_valign(Gtk.Align.CENTER)
+        size_scale.set_size_request(200, -1)
+        size_scale.add_mark(70, Gtk.PositionType.BOTTOM, None)
+        size_row.add_suffix(size_scale)
+        size_row.set_sensitive(s["draw_values"])
+        pending = {"id": 0}
+
+        def save_size():
+            pending["id"] = 0
+            update_settings(text_size=int(size_scale.get_value()))
+            return False
+
+        def size_changed(_):
+            if pending["id"]:
+                GLib.source_remove(pending["id"])
+            pending["id"] = GLib.timeout_add(300, save_size)
+
+        size_scale.connect("value-changed", size_changed)
+
+        def set_draw(on):
+            update_settings(draw_values=on)
+            size_row.set_sensitive(on)
+
         # Top Bar: what sits next to the icon, and how the icon looks.
         accent_options = [("system", f"Match System ({ACCENTS[system_accent()][0]})"
                            if system_accent() in ACCENTS else "Match System")]
@@ -1257,10 +1287,10 @@ def run_settings():
             group("Pinned Values",
                   [switch_row(label, key in s["pinned"], lambda on, k=key: set_pinned(k, on))
                    for key, label, _ in PANEL_METRICS]
-                  + [switch_row("Dim Labels", s["draw_values"],
-                                lambda on: update_settings(draw_values=on),
+                  + [switch_row("Dim Labels", s["draw_values"], set_draw,
                                 "Draws the values as part of the icon so 5h and 7d can be "
-                                "dimmer than the numbers. Turn off to use plain top-bar text")],
+                                "dimmer than the numbers. Turn off to use plain top-bar text"),
+                     size_row],
                   "Shown next to the icon. You can also click a value in the menu to pin it."),
             group("Icon", [
                 combo_row("Style", ICON_STYLES, s["icon_style"], set_style,
