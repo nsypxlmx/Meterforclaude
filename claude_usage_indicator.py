@@ -130,7 +130,7 @@ DEFAULT_SETTINGS = {
     "accent": "system",     # "system" or a key of ACCENTS; used by the color style
     "pinned": ["five_hour", "time"],  # keys of PANEL_METRICS shown in the top bar
     "draw_values": True,    # draw pinned values into the icon, labels dimmer than numbers
-    "text_size": 70,        # drawn text, as a % of the panel font (it reads larger when drawn)
+    "text_size": 100,       # drawn text, as a % of the panel font
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
     "animate": True,        # pulse the ring's center while Claude is writing
@@ -698,7 +698,7 @@ def panel_segments(stats, limit, settings):
 
 PANEL_ICON_PX = 16      # the top bar's icon height in logical pixels
 LABEL_OPACITY = 0.55    # "5h", "7d" and "↻" next to their bright numbers
-TEXT_SIZES = (40, 100)  # range of the Text Size slider, in %
+TEXT_SIZES = (60, 140)  # range of the Text Size slider, in %
 MAX_PANEL_ICONS = 60    # drawn top-bar images kept in the cache
 
 
@@ -717,7 +717,7 @@ def panel_font():
     return desc.get_family() or "Sans", 700, size * interface.get_double("text-scaling-factor")
 
 
-def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=70):
+def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=100):
     """The ring with the pinned values drawn beside it, as one wide SVG.
 
     Tray labels are plain text in a single color; drawing the values ourselves
@@ -780,8 +780,11 @@ def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=70):
 
     ring = open(icon_path(frac, color, inner, pulse)).read()
     width = 64 + text_width
+    # The extension shows wide images at their own size rather than scaling them
+    # to the icon height, so the document size is in logical pixels.
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
-           f'width="{width}" height="64" viewBox="0 0 {width} 64">'
+           f'width="{math.ceil(width / unit)}" height="{PANEL_ICON_PX}" '
+           f'viewBox="0 0 {math.ceil(width / unit) * unit:g} 64">'
            + ring.replace('<svg xmlns="http://www.w3.org/2000/svg" ', '<svg ', 1)
            + text_svg + '</svg>')
     name = "panel-" + hashlib.sha1(svg.encode()).hexdigest()[:16]
@@ -1250,7 +1253,7 @@ def run_settings():
         size_scale.set_hexpand(True)
         size_scale.set_valign(Gtk.Align.CENTER)
         size_scale.set_size_request(200, -1)
-        size_scale.add_mark(70, Gtk.PositionType.BOTTOM, None)
+        size_scale.add_mark(100, Gtk.PositionType.BOTTOM, None)
         size_row.add_suffix(size_scale)
         size_row.set_sensitive(s["draw_values"])
         pending = {"id": 0}
