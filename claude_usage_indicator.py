@@ -1231,7 +1231,7 @@ def run_settings():
         toasts.set_child(toolbar)
 
         window = Adw.ApplicationWindow(application=app, title="Claude Usage Settings",
-                                       default_width=560, default_height=680, content=toasts)
+                                       default_width=460, default_height=680, content=toasts)
         window.present()
 
     app = Adw.Application(application_id="io.github.ClaudeUsage.Settings")
