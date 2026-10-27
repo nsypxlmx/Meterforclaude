@@ -82,6 +82,7 @@ MENU_SECTIONS = [
     ("projects", "Projects"),
     ("models", "Models"),
 ]
+MODEL_SCOPES = [("block", "This Block"), ("today", "Today"), ("week", "Last 7 Days")]
 # Anthropic API list prices, $ per million tokens: (input, output, cache read).
 # Cache writes bill at 1.25x input (5-minute TTL) or 2x input (1-hour TTL).
 # Source: Claude API model table, October 2026.
@@ -115,6 +116,7 @@ DEFAULT_SETTINGS = {
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
     "animate": True,        # pulse the ring's center while Claude is writing
+    "models_scope": "block",  # a key of MODEL_SCOPES
 }
 # Where GNOME's AppIndicator extension places tray icons; it applies to all of them.
 TRAY_SCHEMA = "org.gnome.shell.extensions.appindicator"
@@ -391,24 +393,30 @@ def compute(reader=None, plan=None):
     block, today, week = empty(), empty(), empty()
     days = [0] * 7
     recent = 0
-    models = defaultdict(int)
+    models = {scope: defaultdict(empty) for scope, _ in MODEL_SCOPES}
     projects = defaultdict(empty)
     for t, model, tk, project in entries:
+        counted = model != "<synthetic>"
         if block_active and t >= block_start:
             add(block, tk)
-            if model != "<synthetic>":
-                models[model] += billable(tk)
+            if counted:
+                add(models["block"][model], tk)
             if t >= now - RATE_WINDOW:
                 recent += billable(tk)
         if t >= today_start:
             add(today, tk)
             add(projects[project], tk)
+            if counted:
+                add(models["today"][model], tk)
         if t >= week_start:
             add(week, tk)
             days[(t.astimezone().date() - day_starts[0].date()).days] += billable(tk)
+            if counted:
+                add(models["week"][model], tk)
 
     return {
-        "block": block, "today": today, "week": week, "models": dict(models),
+        "block": block, "today": today, "week": week,
+        "models": {scope: dict(by_model) for scope, by_model in models.items()},
         "projects": dict(projects),
         "days": list(zip(day_starts, days)),
         "recent": recent,
@@ -660,17 +668,34 @@ def menu_lines(stats, limit, settings):
                 add(rest, tk)
             lines.append((f"{len(ranked) - 5} more  {fmt(billable(rest))}{cost(rest)}", "dim"))
 
+    scope = settings["models_scope"]
+    by_model = {m: tk for m, tk in stats["models"].get(scope, {}).items() if billable(tk)}
+    if show["models"] and by_model:
+        scope_label = dict(MODEL_SCOPES).get(scope, "This Block")
+        lines += [None, (f"{scope_label.upper()} BY MODEL", "dim")]
+        ranked = sorted(by_model.items(), key=lambda x: -billable(x[1]))
+        if len(ranked) == 1:
+            name, tk = ranked[0]
+            lines.append((f"All on {model_name(name)}  ·  {fmt(billable(tk))}{cost(tk)}", "main"))
+        else:
+            scope_total = sum(billable(tk) for _, tk in ranked)
+            rows = ranked[:4]
+            if len(ranked) > 4:
+                rest = empty()
+                for _, tk in ranked[4:]:
+                    add(rest, tk)
+                rows.append((f"{len(ranked) - 4} more", rest))
+            for name, tk in rows:
+                share = billable(tk) / scope_total
+                label = name if name.endswith(" more") else model_name(name)
+                lines.append((f"{bar(share, bars, width=8)}  {label}  {share * 100:.0f}%  ·  "
+                              f"{fmt(billable(tk))}{cost(tk)}", "main"))
+
     if show["cost"] and any(line and "≈" in line[0] for line in lines):
         note = "≈ is what this usage would cost at API list prices"
         if stats["week"]["unpriced"]:
             note += f"; {fmt(stats['week']['unpriced'])} tokens on unpriced models not included"
         lines.append((note, "dim"))
-
-    if show["models"] and stats["models"]:
-        lines += [None, ("BLOCK BY MODEL", "dim")]
-        block_total = sum(stats["models"].values()) or 1
-        for m, n in sorted(stats["models"].items(), key=lambda x: -x[1]):
-            lines.append((f"{model_name(m)}  {fmt(n)}  ({n * 100 // block_total}%)", "main"))
     return lines
 
 
@@ -967,6 +992,11 @@ def run_indicator(override):
             mi.set_active(settings["show"][key])
             mi.connect("toggled", toggle_section, key)
             sub.append(mi)
+        sub.append(Gtk.SeparatorMenuItem())
+        header(sub, "MODELS COVER")
+        radio_group(sub, [(label, settings["models_scope"] == key,
+                           lambda k=key: set_setting("models_scope", k))
+                          for key, label in MODEL_SCOPES])
         return sub
 
     def build_menu(stats, limit):
