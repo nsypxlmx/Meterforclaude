@@ -4,9 +4,9 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)/claude_usage_indicator.py"
 DEST="$HOME/.local/share/claude-usage/claude_usage_indicator.py"
-LIMIT="${1:-0}"   # optional: ./install.sh 5000000  (token budget per 5h block)
+LIMIT="${1:-0}"   # optional: ./install.sh 5000000  (fixed limit per 5h block; normally set from the menu)
 
-sudo apt-get install -y python3-gi gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator
+sudo apt-get install -y python3-gi gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator gir1.2-notify-0.7
 
 mkdir -p "$(dirname "$DEST")" "$HOME/.config/autostart"
 install -m 755 "$SRC" "$DEST"
