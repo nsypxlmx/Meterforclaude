@@ -694,19 +694,19 @@ def icon_path(frac, color, inner=None, pulse=None):
                     f'transform="rotate(-90 32 32)"/>')
         return out
 
+    # A slow "breath" while Claude writes: the outer track brightens and the
+    # dot swells to nearly fill the ring's hole, then both settle back. At 16 px
+    # anything subtler can't be seen.
+    wave = (1 - math.cos(2 * math.pi * pulse / PULSE_FRAMES)) / 2 if pulse is not None else 0
+    track = 0.25 + 0.45 * wave
     if inner:
-        body = ring(25, 7, step, color, 0.25) + ring(14, 6, inner_step, inner[1], 0.18)
+        body = ring(25, 7, step, color, track) + ring(14, 6, inner_step, inner[1], 0.18)
         dot_r, hole, dot_color = 4.0, 11.0, color
     else:
-        body = ring(22, 9, step, color, 0.25)
+        body = ring(22, 9, step, color, track)
         dot_r, hole, dot_color = 7.0, 17.5, color
-    dot_opacity = 1.0
-    if pulse is not None:
-        # A slow "breath": the dot swells to nearly fill the ring's hole and
-        # fades, then settles back. At 16 px anything smaller can't be seen.
-        wave = (1 - math.cos(2 * math.pi * pulse / PULSE_FRAMES)) / 2
-        dot_r += (hole - 2 - dot_r) * wave
-        dot_opacity = 1 - 0.3 * wave
+    dot_r += (hole - 2 - dot_r) * wave
+    dot_opacity = 1 - 0.3 * wave
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
            f'{body}<circle cx="32" cy="32" r="{dot_r:.2f}" fill="{dot_color}" '
            f'fill-opacity="{dot_opacity:.2f}"/></svg>')
