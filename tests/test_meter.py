@@ -177,6 +177,15 @@ class FormattingTest(unittest.TestCase):
         self.assertEqual(meter.duration(3 * 3600 + 5 * 60 + 59), "3h05m")
         self.assertEqual(meter.duration(-10), "0h00m")
 
+    def test_clock_follows_12_or_24_hour_setting(self):
+        local = datetime(2026, 10, 27, 15, 5).astimezone()
+        with mock.patch.object(meter, "uses_12h", return_value=False):
+            self.assertEqual(meter.clock(local), "15:05")
+            self.assertEqual(meter.clock(local, "%a"), "Tue 15:05")
+        with mock.patch.object(meter, "uses_12h", return_value=True):
+            self.assertEqual(meter.clock(local), "3:05 PM")
+            self.assertEqual(meter.clock(local, "%A at"), "Tuesday at 3:05 PM")
+
     def test_settings_migrate_old_panel_style(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "settings.json")

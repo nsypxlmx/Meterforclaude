@@ -44,12 +44,17 @@ cd Meterforclaude
 ./install.sh
 ```
 
-The installer asks before using `sudo` (Debian/Ubuntu packages) and before
-changing Claude Code's settings. `./install.sh --yes` answers yes to both;
-`--no-statusline` skips the plan-limits step. On other distributions it lists
-the packages to install yourself.
+The installer asks before using `sudo` to install packages (apt on
+Debian/Ubuntu, dnf on Fedora, pacman on Arch) and before changing Claude Code's
+settings. `./install.sh --yes` answers yes to both; `--no-statusline` skips the
+plan-limits step. With any other package manager it lists the packages to
+install yourself. If it had to install the AppIndicator extension, log out and
+back in once so GNOME loads it.
 
 The meter is installed to `~/.local/share/claude-usage/` and starts on login.
+Its Settings window is in the app grid as *Usage Meter for Claude Code*, and in
+the meter's menu. Times follow the 12- or 24-hour format chosen in GNOME's
+Date & Time settings.
 
 ### Real plan limits
 

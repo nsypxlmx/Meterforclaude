@@ -534,8 +534,31 @@ def spark(values):
     return "".join(SPARK[0] if v == 0 else SPARK[1 + int(v / peak * 6.999)] for v in values)
 
 
-def clock(dt):
-    return dt.astimezone().strftime("%H:%M")
+@functools.lru_cache(maxsize=1)
+def uses_12h():
+    """True when the clock should read 3:05 PM: GNOME's Date & Time setting,
+    or the locale's time format where that setting doesn't exist."""
+    try:
+        from gi.repository import Gio
+        schema = Gio.SettingsSchemaSource.get_default().lookup("org.gnome.desktop.interface", True)
+        if schema and schema.has_key("clock-format"):
+            return Gio.Settings.new("org.gnome.desktop.interface").get_string("clock-format") == "12h"
+    except (ImportError, ValueError):
+        pass
+    import locale
+    try:
+        locale.setlocale(locale.LC_TIME, "")
+    except locale.Error:
+        pass
+    return "%p" in locale.nl_langinfo(locale.T_FMT) or "%I" in locale.nl_langinfo(locale.T_FMT)
+
+
+def clock(dt, day=""):
+    """Local time in the user's 12- or 24-hour format, optionally after a
+    strftime day such as "%a" (Tue 15:05) or "%A at" (Tuesday at 15:05)."""
+    dt = dt.astimezone()
+    time = dt.strftime("%-I:%M %p") if uses_12h() else dt.strftime("%H:%M")
+    return f"{dt.strftime(day)} {time}" if day else time
 
 
 def duration(seconds):
@@ -889,7 +912,7 @@ def menu_lines(stats, limit, settings):
     if "seven_day" in plan:
         weekly = plan["seven_day"]
         main.append((f"{bar(weekly['pct'] / 100, bars)}  {weekly['pct']:.0f}% of weekly limit  ·  "
-                     f"resets {weekly['reset'].astimezone():%a %H:%M}", "main", "weekly"))
+                     f"resets {clock(weekly['reset'], '%a')}", "main", "weekly"))
     if stats["block_active"]:
         line = f"{time_left(stats)} left"
         forecast = projection(stats, limit) if show["forecast"] else None
@@ -997,7 +1020,7 @@ def due_alerts(stats, limit, settings, state):
         pct = round(weekly["pct"])
         if crossed(pct, settings["alerts"], state, "week", weekly["reset"].isoformat()):
             alerts.append((f"Weekly limit at {pct}%",
-                           f"Resets {weekly['reset'].astimezone():%A at %H:%M}."))
+                           f"Resets {clock(weekly['reset'], '%A at')}."))
     return alerts
 
 
@@ -1340,10 +1363,19 @@ def run_indicator(override):
             ind.set_menu(menu)
         return True
 
-    # Follow the system accent the moment it changes, not at the next refresh.
-    if system_accent():
+    # Follow the system accent and clock format the moment they change, not at
+    # the next refresh.
+    schema = Gio.SettingsSchemaSource.get_default().lookup("org.gnome.desktop.interface", True)
+    if schema:
         interface = Gio.Settings.new("org.gnome.desktop.interface")
-        interface.connect("changed::accent-color", lambda *_: refresh())
+        if system_accent():
+            interface.connect("changed::accent-color", lambda *_: refresh())
+
+        def clock_format_changed(*_):
+            uses_12h.cache_clear()
+            refresh()
+        if schema.has_key("clock-format"):
+            interface.connect("changed::clock-format", clock_format_changed)
 
     refresh()
     # Seconds-based timers let GLib batch wakeups with other processes.

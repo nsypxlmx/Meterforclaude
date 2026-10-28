@@ -18,7 +18,8 @@ if [ -f "$DEST_DIR/statusline_setup.py" ] && [ -f "$CLAUDE_DIR/settings.json" ];
         "$DEST_DIR/claude_usage_statusline.py" "$CLAUDE_DIR/settings.json"
 fi
 
-rm -f "$HOME/.config/autostart/claude-usage.desktop"
+rm -f "$HOME/.config/autostart/claude-usage.desktop" \
+      "$HOME/.local/share/applications/io.github.nsypxlmx.UsageMeterForClaudeCode.Settings.desktop"
 rm -rf "$DEST_DIR"
 
 if [ "$PURGE" = 0 ] && [ -t 0 ]; then
