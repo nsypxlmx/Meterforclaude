@@ -39,8 +39,8 @@ where your tokens went.
 ## Install
 
 ```sh
-git clone https://github.com/nsypxlmx/usage-meter-for-claude-code.git
-cd usage-meter-for-claude-code
+git clone https://github.com/nsypxlmx/Meterforclaude.git
+cd Meterforclaude
 ./install.sh
 ```
 
