@@ -57,7 +57,7 @@ STATE_PATH = os.path.join(ICON_DIR, "state.json")
 LIMITS_PATH = os.path.join(ICON_DIR, "limits.json")
 SETTINGS_PATH = os.path.expanduser("~/.config/claude-usage/settings.json")
 # Touched by the settings window to play the animation in the top bar for a moment.
-PREVIEW_PATH = os.path.join(ICON_DIR, "preview")
+PREVIEW_PATH = os.path.join(ICON_DIR, "play-preview")
 PREVIEW_SECONDS = 6    # two loops, plus up to one WATCH_SECONDS before the tray notices
 BLOCK_HOURS = 5
 WATCH_SECONDS = 2      # how often the tray checks (a few stat calls) whether anything changed
@@ -1605,8 +1605,8 @@ def run_settings():
                 picture.set_filename(icon_path(0.62, color, (0.35, color), shape=key))
 
         def set_shape(key):
-            update_settings(icon_shape=key)
-            preview()
+            if update_settings(icon_shape=key)["animation"] != "none":
+                play_preview()
 
         def set_style(key):
             update_settings(icon_style=key)
@@ -1627,7 +1627,11 @@ def run_settings():
         animation_row.add_suffix(preview_button)
 
         def play_preview(*_):
-            preview()
+            try:
+                preview()
+            except OSError as e:
+                toasts.add_toast(Adw.Toast(title=f"Couldn’t start the preview: {e.strerror}"))
+                return
             toasts.add_toast(Adw.Toast(title="Playing in the top bar", timeout=2))
 
         def set_animation(key):
