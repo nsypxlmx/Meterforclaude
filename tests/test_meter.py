@@ -196,6 +196,31 @@ class FormattingTest(unittest.TestCase):
         self.assertEqual(settings["pinned"], ["five_hour"])
         self.assertNotIn("panel", settings)
 
+    def test_settings_migrate_animate_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            for raw, expected in (({"animate": False}, "none"), ({"animate": True}, "breathe"),
+                                  ({"animate": False, "animation": "orbit"}, "orbit")):
+                with open(path, "w") as f:
+                    json.dump(raw, f)
+                with mock.patch.object(meter, "SETTINGS_PATH", path):
+                    settings = meter.load_settings()
+                self.assertEqual(settings["animation"], expected)
+                self.assertNotIn("animate", settings)
+
+    def test_every_shape_and_animation_draws(self):
+        import xml.dom.minidom
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(meter, "ICON_DIR", tmp):
+            for shape, _ in meter.ICON_SHAPES:
+                for inner in (None, (0.4, "#6F8396")):
+                    for frac in (0.0, 0.62, 1.0):
+                        pulses = [None] + [(anim, frame) for anim, _ in meter.ANIMATIONS
+                                           if anim != "none" for frame in range(meter.PULSE_FRAMES)]
+                        for pulse in pulses:
+                            path = meter.icon_path(frac, "#5BB974", inner, pulse, shape)
+                            xml.dom.minidom.parse(path)  # well-formed SVG
+            self.assertEqual(len(os.listdir(tmp)), 3 * 2 * 3 * (1 + 3 * meter.PULSE_FRAMES))
+
 
 class ConfigDirTest(unittest.TestCase):
     def test_default(self):

@@ -105,6 +105,10 @@ PANEL_MIGRATION = {"usage_time": ["five_hour", "time"], "usage": ["five_hour"],
 FIGURE_SPACE = " "  # as wide as a digit, so numbers don't shift the label
 # Symbolic icons are drawn like other top-bar icons and only take color near a limit.
 ICON_STYLES = [("symbolic", "Symbolic"), ("color", "Color")]
+# Each shows the 5-hour block and, when the plan reports it, the weekly limit.
+ICON_SHAPES = [("ring", "Ring"), ("pie", "Pie"), ("bars", "Bars")]
+# Played while Claude is writing.
+ANIMATIONS = [("breathe", "Breathe"), ("orbit", "Orbit"), ("blink", "Blink"), ("none", "None")]
 SYMBOLIC = "#FFFFFF"
 MENU_SECTIONS = [
     ("forecast", "Forecast"),
@@ -145,13 +149,14 @@ DEFAULT_SETTINGS = {
     "alerts": [75, 90],
     "reset_alert": True,
     "icon_style": "symbolic",  # a key of ICON_STYLES
+    "icon_shape": "ring",   # a key of ICON_SHAPES
     "accent": "system",     # "system" or a key of ACCENTS; used by the color style
     "pinned": ["five_hour", "time"],  # keys of PANEL_METRICS shown in the top bar
     "draw_values": True,    # draw pinned values into the icon, labels dimmer than numbers
     "text_size": 100,       # drawn text, as a % of the panel font
     "bars": "pills",        # a key of BAR_STYLES
     "show": {key: True for key, _ in MENU_SECTIONS},
-    "animate": True,        # pulse the ring's center while Claude is writing
+    "animation": "breathe",  # a key of ANIMATIONS
     "models_scope": "block",    # a key of SCOPES
     "projects_scope": "today",  # a key of SCOPES
 }
@@ -159,7 +164,7 @@ DEFAULT_SETTINGS = {
 TRAY_SCHEMA = "org.gnome.shell.extensions.appindicator"
 TRAY_POSITIONS = [("left", "Left"), ("center", "Center"), ("right", "Right")]
 ACTIVE_SECONDS = 12   # a log written this recently means Claude is mid-reply
-PULSE_FRAMES = 6
+PULSE_FRAMES = 8
 PULSE_MS = 250   # each frame is a new image the shell has to load; keep it slow
 
 
@@ -252,6 +257,10 @@ def load_settings():
     if "pinned" not in raw and "panel" in raw:
         settings["pinned"] = list(PANEL_MIGRATION.get(raw["panel"], DEFAULT_SETTINGS["pinned"]))
     settings.pop("panel", None)
+    # Older versions had an on/off switch for the one animation.
+    if "animation" not in raw and raw.get("animate") is False:
+        settings["animation"] = "none"
+    settings.pop("animate", None)
     return settings
 
 
@@ -668,48 +677,112 @@ def gauge(stats, limit, settings):
     return block_elapsed(stats), accent, None
 
 
-def icon_path(frac, color, inner=None, pulse=None):
-    """Write (once) and return an SVG ring gauge; 2% steps keep the cache small.
+def icon_path(frac, color, inner=None, pulse=None, shape="ring"):
+    """Write (once) and return an SVG gauge in one of ICON_SHAPES; 2% steps keep
+    the cache small.
 
-    pulse is an animation frame index (0..PULSE_FRAMES-1) or None for a still icon."""
+    pulse is (animation, frame) with animation a key of ANIMATIONS and frame
+    0..PULSE_FRAMES-1, or None for a still icon."""
     step = int(frac * 50) * 2
     inner_step = int(inner[0] * 50) * 2 if inner else None
-    name = f"gauge-{color.lstrip('#').lower()}-{step}"
+    name = f"{shape}-{color.lstrip('#').lower()}-{step}"
     if inner:
         name += f"-i{inner[1].lstrip('#').lower()}-{inner_step}"
     if pulse is not None:
-        name += f"-p{pulse}"
+        name += f"-{pulse[0]}{pulse[1]}"
     path = os.path.join(ICON_DIR, name + ".svg")
     if os.path.exists(path):
         return path
 
-    def ring(r, width, value, stroke, track_opacity):
-        circ = 2 * math.pi * r
-        out = (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="#ffffff" '
-               f'stroke-opacity="{track_opacity}" stroke-width="{width}"/>')
-        if value:
-            out += (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="{stroke}" '
-                    f'stroke-width="{width}" stroke-linecap="round" '
-                    f'stroke-dasharray="{circ * value / 100:.2f} {circ:.2f}" '
-                    f'transform="rotate(-90 32 32)"/>')
-        return out
+    anim, frame = pulse if pulse is not None else (None, 0)
+    # Every animation is a slow loop: 0 at rest, 1 halfway through, back to 0.
+    wave = (1 - math.cos(2 * math.pi * frame / PULSE_FRAMES)) / 2 if anim else 0
+    # Breathe brightens the empty track so the whole shape swells into view;
+    # at 16 px anything subtler can't be seen.
+    track = 0.25 + 0.45 * wave if anim == "breathe" else 0.25
 
-    # A slow "breath" while Claude writes: the outer track brightens and the
-    # dot swells to nearly fill the ring's hole, then both settle back. At 16 px
-    # anything subtler can't be seen.
-    wave = (1 - math.cos(2 * math.pi * pulse / PULSE_FRAMES)) / 2 if pulse is not None else 0
-    track = 0.25 + 0.45 * wave
-    if inner:
-        body = ring(25, 7, step, color, track) + ring(14, 6, inner_step, inner[1], 0.18)
-        dot_r, hole, dot_color = 4.0, 11.0, color
+    def arc(r, width, value, stroke, opacity, start=0):
+        """value% of a circle, clockwise from start degrees past 12 o'clock."""
+        circ = 2 * math.pi * r
+        if not value:
+            return ""
+        return (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="{stroke}" '
+                f'stroke-opacity="{opacity:.2f}" stroke-width="{width}" stroke-linecap="round" '
+                f'stroke-dasharray="{circ * value / 100:.2f} {circ:.2f}" '
+                f'transform="rotate({start - 90:g} 32 32)"/>')
+
+    def ring(r, width, value, stroke, track_opacity):
+        return (f'<circle cx="32" cy="32" r="{r}" fill="none" stroke="#ffffff" '
+                f'stroke-opacity="{track_opacity:.2f}" stroke-width="{width}"/>'
+                + arc(r, width, value, stroke, 1))
+
+    def wedge(r, value, fill):
+        if value >= 100:
+            return f'<circle cx="32" cy="32" r="{r}" fill="{fill}"/>'
+        if not value:
+            return ""
+        a = 2 * math.pi * value / 100
+        x, y = 32 + r * math.sin(a), 32 - r * math.cos(a)
+        return (f'<path d="M32 32 L32 {32 - r} A{r} {r} 0 {int(value > 50)} 1 {x:.2f} {y:.2f} Z" '
+                f'fill="{fill}"/>')
+
+    def orbit(r, width):
+        """A bright segment that travels once around the track per loop."""
+        return arc(r, width, 18, "#ffffff", 0.85, 360 * frame / PULSE_FRAMES)
+
+    def bar(x, w, value, fill):
+        top, height = 6, 52
+        filled = height * value / 100
+        clip = f"bar{x}"
+        out = (f'<clipPath id="{clip}"><rect x="{x}" y="{top}" width="{w}" height="{height}" '
+               f'rx="{w / 2:g}"/></clipPath><g clip-path="url(#{clip})">'
+               f'<rect x="{x}" y="{top}" width="{w}" height="{height}" fill="#ffffff" '
+               f'fill-opacity="{track:.2f}"/>'
+               f'<rect x="{x}" y="{top + height - filled:.2f}" width="{w}" height="{filled:.2f}" '
+               f'fill="{fill}"/>')
+        if anim == "orbit":
+            # A band of light rising through the bar, like a level being read.
+            band = 14
+            y = top + height - (height + band) * frame / PULSE_FRAMES
+            out += (f'<rect x="{x}" y="{y:.2f}" width="{w}" height="{band}" fill="#ffffff" '
+                    f'fill-opacity="0.55"/>')
+        return out + "</g>"
+
+    if shape == "pie":
+        # The 5-hour block as a filled wedge; the weekly limit as a rim around it.
+        if inner:
+            body = (ring(28, 5, inner_step, inner[1], track)
+                    + f'<circle cx="32" cy="32" r="21" fill="#ffffff" fill-opacity="{track:.2f}"/>'
+                    + wedge(21, step, color))
+            body += orbit(28, 5) if anim == "orbit" else ""
+        else:
+            body = (f'<circle cx="32" cy="32" r="28" fill="#ffffff" fill-opacity="{track:.2f}"/>'
+                    + wedge(28, step, color))
+            body += orbit(25, 6) if anim == "orbit" else ""
+    elif shape == "bars":
+        # The 5-hour block on the left, the weekly limit on the right.
+        if inner:
+            body = bar(12, 17, step, color) + bar(35, 17, inner_step, inner[1])
+        else:
+            body = bar(21, 22, step, color)
     else:
-        body = ring(22, 9, step, color, track)
-        dot_r, hole, dot_color = 7.0, 17.5, color
-    dot_r += (hole - 2 - dot_r) * wave
-    dot_opacity = 1 - 0.3 * wave
+        if inner:
+            body = ring(25, 7, step, color, track) + ring(14, 6, inner_step, inner[1], 0.18)
+            dot_r, hole = 4.0, 11.0
+            body += orbit(25, 7) if anim == "orbit" else ""
+        else:
+            body = ring(22, 9, step, color, track)
+            dot_r, hole = 7.0, 17.5
+            body += orbit(22, 9) if anim == "orbit" else ""
+        # The center dot swells to nearly fill the ring's hole as it breathes.
+        if anim == "breathe":
+            dot_r += (hole - 2 - dot_r) * wave
+        body += (f'<circle cx="32" cy="32" r="{dot_r:.2f}" fill="{color}" '
+                 f'fill-opacity="{1 - 0.3 * wave if anim == "breathe" else 1:.2f}"/>')
+    if anim == "blink":
+        body = f'<g opacity="{1 - 0.65 * wave:.2f}">{body}</g>'
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
-           f'{body}<circle cx="32" cy="32" r="{dot_r:.2f}" fill="{dot_color}" '
-           f'fill-opacity="{dot_opacity:.2f}"/></svg>')
+           f'{body}</svg>')
     os.makedirs(ICON_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(svg)
@@ -776,7 +849,7 @@ def panel_font():
     return desc.get_family() or "Sans", 700, size * interface.get_double("text-scaling-factor")
 
 
-def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=100):
+def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=100, shape="ring"):
     """The ring with the pinned values drawn beside it, as one wide SVG.
 
     Tray labels are plain text in a single color; drawing the values ourselves
@@ -837,7 +910,7 @@ def panel_icon_path(frac, color, inner, segments, pulse=None, text_size=100):
     text_svg = buf.getvalue().decode()
     text_svg = text_svg[text_svg.index("<svg"):].replace("<svg ", '<svg x="64" ', 1)
 
-    ring = open(icon_path(frac, color, inner, pulse)).read()
+    ring = open(icon_path(frac, color, inner, pulse, shape)).read()
     width = 64 + text_width
     # The extension shows wide images at their own size rather than scaling them
     # to the icon height, so the document size is in logical pixels.
@@ -1118,7 +1191,8 @@ def run_indicator(override):
         if color in (None, SYMBOLIC):
             color = accent_color(settings)
         try:
-            Notify.Notification.new(title, body, icon_path(frac, color)).show()
+            Notify.Notification.new(title, body,
+                                    icon_path(frac, color, shape=settings["icon_shape"])).show()
         except Exception as e:  # a missing notification daemon shouldn't stop the tray
             print("notify error:", e, file=sys.stderr)
 
@@ -1151,20 +1225,21 @@ def run_indicator(override):
                          start_new_session=True)
 
     @functools.lru_cache(maxsize=2 * PULSE_FRAMES)
-    def drawn_icon(spec, segments, pulse, text_size):
-        return panel_icon_path(*spec, list(segments), pulse, text_size)
+    def drawn_icon(spec, segments, pulse, text_size, shape):
+        return panel_icon_path(*spec, list(segments), pulse, text_size, shape)
 
     def current_icon():
-        pulse = current["frame"] if current["anim"] else None
+        pulse = (settings["animation"], current["frame"]) if current["anim"] else None
+        shape = settings["icon_shape"]
         if current["segments"]:
             try:
                 return drawn_icon(current["spec"], tuple(current["segments"]), pulse,
-                                  settings["text_size"])
+                                  settings["text_size"], shape)
             except Exception as e:  # fall back to the plain text label
                 print("draw error:", e, file=sys.stderr)
                 current["segments"] = None
                 ind.set_label(*current["label"])
-        return icon_path(*current["spec"], pulse=pulse)
+        return icon_path(*current["spec"], pulse=pulse, shape=shape)
 
     def step_pulse():
         current["frame"] = (current["frame"] + 1) % PULSE_FRAMES
@@ -1194,7 +1269,7 @@ def run_indicator(override):
         if seen != current["seen"] or now - current["refreshed"] > SAFETY_REFRESH:
             current["seen"] = seen
             refresh()
-        working = (settings["animate"] and not power["saving"] and current["spec"] is not None
+        working = (settings["animation"] != "none" and not power["saving"] and current["spec"] is not None
                    and now - reader.latest_write() < ACTIVE_SECONDS)
         if working and not current["anim"]:
             current["frame"] = 0
@@ -1321,7 +1396,7 @@ def run_indicator(override):
 
             # Only touch the panel when something visible changed: replacing the
             # menu closes it if it's open, and refreshes are frequent.
-            icon = icon_path(frac, color, inner)
+            icon = icon_path(frac, color, inner, shape=settings["icon_shape"])
             label, guide = panel_label(stats, limit, settings)
             current["label"] = (label, guide)
             segments = panel_segments(stats, limit, settings) if settings["draw_values"] else []
@@ -1492,12 +1567,15 @@ def run_settings():
                      size_row],
                   "Shown next to the icon. You can also click a value in the menu to pin it."),
             group("Icon", [
+                combo_row("Shape", ICON_SHAPES, s["icon_shape"],
+                          lambda k: update_settings(icon_shape=k),
+                          "Shows the 5-hour block, and the weekly limit when your plan reports it"),
                 combo_row("Style", ICON_STYLES, s["icon_style"], set_style,
                           "Symbolic matches the other top-bar icons and turns amber and red near a limit"),
                 accent_row,
-                switch_row("Animate While Claude Is Working", s["animate"],
-                           lambda on: update_settings(animate=on),
-                           "Pauses on battery and in Power Saver"),
+                combo_row("Animation", ANIMATIONS, s["animation"],
+                          lambda k: update_settings(animation=k),
+                          "Plays while Claude is writing. Pauses on battery and in Power Saver"),
             ]),
         ]
         if tray:

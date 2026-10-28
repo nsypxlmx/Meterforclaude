@@ -11,9 +11,10 @@ where your tokens went.
 
 ## Features
 
-- **Top bar:** a ring gauge, plus the values you pin (5-hour %, weekly %,
-  time left, tokens, cost today). Labels are drawn dimmer than the numbers;
-  the ring and numbers turn amber at 75% and red at 90%.
+- **Top bar:** a gauge (ring, pie or bars), plus the values you pin (5-hour %,
+  weekly %, time left, tokens, cost today). Labels are drawn dimmer than the
+  numbers; the gauge and numbers turn amber at 75% and red at 90%. While
+  Claude is writing, the gauge breathes, orbits or blinks (your choice).
 - **Menu:** 5-hour and weekly bars, time left with a forecast ("limit likely
   at 19:04, 1h06m before reset"), and History, Projects and Models
   breakdowns. Click a value to pin it to the top bar.
