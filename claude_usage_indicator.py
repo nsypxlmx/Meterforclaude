@@ -696,16 +696,17 @@ def icon_path(frac, color, inner=None, pulse=None):
 
     if inner:
         body = ring(25, 7, step, color, 0.25) + ring(14, 6, inner_step, inner[1], 0.18)
-        dot_r, dot_color = 4.0, color
+        dot_r, hole, dot_color = 4.0, 11.0, color
     else:
         body = ring(22, 9, step, color, 0.25)
-        dot_r, dot_color = 7.0, color
+        dot_r, hole, dot_color = 7.0, 17.5, color
     dot_opacity = 1.0
     if pulse is not None:
-        # A slow "breath": the dot swells and fades, then settles back.
+        # A slow "breath": the dot swells to nearly fill the ring's hole and
+        # fades, then settles back. At 16 px anything smaller can't be seen.
         wave = (1 - math.cos(2 * math.pi * pulse / PULSE_FRAMES)) / 2
-        dot_r *= 1 + 0.45 * wave
-        dot_opacity = 1 - 0.35 * wave
+        dot_r += (hole - 2 - dot_r) * wave
+        dot_opacity = 1 - 0.3 * wave
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
            f'{body}<circle cx="32" cy="32" r="{dot_r:.2f}" fill="{dot_color}" '
            f'fill-opacity="{dot_opacity:.2f}"/></svg>')
