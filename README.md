@@ -28,6 +28,12 @@ where your tokens went.
   pauses while the screen is locked, and the activity animation stops on
   battery and in Power Saver.
 
+![Ring, Pie and Bars icons, each breathing, orbiting and blinking](docs/animations.gif)
+
+Pick a shape and animation in Settings › Top Bar › Icon; changing either plays
+it in the top bar so you can see it right away. (`docs/make_gif.py` draws this
+image from the meter's own code.)
+
 ## Requirements
 
 - GNOME with the AppIndicator extension (built into Ubuntu; elsewhere

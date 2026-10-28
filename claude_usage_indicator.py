@@ -56,6 +56,9 @@ STATE_PATH = os.path.join(ICON_DIR, "state.json")
 # Written by claude_usage_statusline.py with the plan limits Claude Code reports.
 LIMITS_PATH = os.path.join(ICON_DIR, "limits.json")
 SETTINGS_PATH = os.path.expanduser("~/.config/claude-usage/settings.json")
+# Touched by the settings window to play the animation in the top bar for a moment.
+PREVIEW_PATH = os.path.join(ICON_DIR, "preview")
+PREVIEW_SECONDS = 6    # two loops, plus up to one WATCH_SECONDS before the tray notices
 BLOCK_HOURS = 5
 WATCH_SECONDS = 2      # how often the tray checks (a few stat calls) whether anything changed
 SAFETY_REFRESH = 300   # full refresh at least this often, in seconds, in case a change was missed
@@ -1269,8 +1272,14 @@ def run_indicator(override):
         if seen != current["seen"] or now - current["refreshed"] > SAFETY_REFRESH:
             current["seen"] = seen
             refresh()
-        working = (settings["animation"] != "none" and not power["saving"] and current["spec"] is not None
-                   and now - reader.latest_write() < ACTIVE_SECONDS)
+        try:
+            previewing = now - os.stat(PREVIEW_PATH).st_mtime < PREVIEW_SECONDS
+        except OSError:
+            previewing = False
+        # A preview was asked for, so it plays even on battery.
+        working = (settings["animation"] != "none" and current["spec"] is not None
+                   and (previewing or (not power["saving"]
+                                       and now - reader.latest_write() < ACTIVE_SECONDS)))
         if working and not current["anim"]:
             current["frame"] = 0
             current["anim"] = GLib.timeout_add(PULSE_MS, step_pulse)
@@ -1466,7 +1475,7 @@ def run_settings():
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gio, GLib, Gtk
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
     tray = None
     schema = Gio.SettingsSchemaSource.get_default().lookup(TRAY_SCHEMA, True)
@@ -1553,9 +1562,81 @@ def run_settings():
                                lambda k: update_settings(accent=k))
         accent_row.set_sensitive(s["icon_style"] == "color")
 
+        def preview():
+            """Play the animation in the top bar; the tray checks for this file."""
+            os.makedirs(ICON_DIR, exist_ok=True)
+            with open(PREVIEW_PATH, "w"):
+                pass
+            os.utime(PREVIEW_PATH)
+
+        # Shape: a picture of each, drawn on the top bar's dark background.
+        css = Gtk.CssProvider()
+        css.load_from_string(".shape-thumb { background: #1d1d20; border-radius: 6px; padding: 6px; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        shape_row = Adw.ActionRow(title="Shape")
+        shape_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER, margin_top=6, margin_bottom=6)
+        thumbs = {}
+        first = None
+        for key, label in ICON_SHAPES:
+            picture = Gtk.Picture(can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN)
+            picture.set_size_request(28, 28)
+            frame = Gtk.Box(halign=Gtk.Align.CENTER)
+            frame.add_css_class("shape-thumb")
+            frame.append(picture)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            content.append(frame)
+            content.append(Gtk.Label(label=label))
+            button = Gtk.ToggleButton(child=content, active=key == s["icon_shape"],
+                                      tooltip_text=f"{label} Shape")
+            button.add_css_class("flat")
+            if first:
+                button.set_group(first)
+            first = first or button
+            button.connect("toggled", lambda b, k=key: b.get_active() and set_shape(k))
+            shape_box.append(button)
+            thumbs[key] = picture
+        shape_row.add_suffix(shape_box)
+
+        def draw_thumbs():
+            now = load_settings()
+            color = SYMBOLIC if now["icon_style"] == "symbolic" else accent_color(now)
+            for key, picture in thumbs.items():
+                picture.set_filename(icon_path(0.62, color, (0.35, color), shape=key))
+
+        def set_shape(key):
+            update_settings(icon_shape=key)
+            preview()
+
         def set_style(key):
             update_settings(icon_style=key)
             accent_row.set_sensitive(key == "color")
+            draw_thumbs()
+
+        accent_row.connect("notify::selected", lambda *_: draw_thumbs())
+        draw_thumbs()
+
+        # Animation: changing it, or the Preview button, plays it in the top bar.
+        animation_row = combo_row("Animation", ANIMATIONS, s["animation"],
+                                  lambda k: set_animation(k),
+                                  "While Claude is writing")
+        preview_button = Gtk.Button(icon_name="media-playback-start-symbolic",
+                                    valign=Gtk.Align.CENTER, tooltip_text="Preview in Top Bar",
+                                    sensitive=s["animation"] != "none")
+        preview_button.add_css_class("flat")
+        animation_row.add_suffix(preview_button)
+
+        def play_preview(*_):
+            preview()
+            toasts.add_toast(Adw.Toast(title="Playing in the top bar", timeout=2))
+
+        def set_animation(key):
+            update_settings(animation=key)
+            preview_button.set_sensitive(key != "none")
+            if key != "none":
+                play_preview()
+
+        preview_button.connect("clicked", play_preview)
 
         top_groups = [
             group("Pinned Values",
@@ -1567,16 +1648,13 @@ def run_settings():
                      size_row],
                   "Shown next to the icon. You can also click a value in the menu to pin it."),
             group("Icon", [
-                combo_row("Shape", ICON_SHAPES, s["icon_shape"],
-                          lambda k: update_settings(icon_shape=k),
-                          "Shows the 5-hour block, and the weekly limit when your plan reports it"),
+                shape_row,
                 combo_row("Style", ICON_STYLES, s["icon_style"], set_style,
-                          "Symbolic matches the other top-bar icons and turns amber and red near a limit"),
+                          "Symbolic turns amber and red near a limit"),
                 accent_row,
-                combo_row("Animation", ANIMATIONS, s["animation"],
-                          lambda k: update_settings(animation=k),
-                          "Plays while Claude is writing. Pauses on battery and in Power Saver"),
-            ]),
+                animation_row,
+            ], "Shows the 5-hour block, and the weekly limit when your plan reports it. "
+               "Animations pause on battery and in Power Saver."),
         ]
         if tray:
             top_groups.append(group("Position", [
