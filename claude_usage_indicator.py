@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Claude usage tray indicator for Ubuntu (GNOME / AppIndicator).
+"""Usage Meter for Claude Code: a GNOME top-bar indicator.
 
-Reads Claude Code session logs in ~/.claude/projects/**/*.jsonl and shows
-token usage for the current 5-hour block, today, and the last 7 days.
+Not affiliated with or endorsed by Anthropic.
+
+Reads Claude Code session logs in ~/.claude/projects/**/*.jsonl (or
+$CLAUDE_CONFIG_DIR/projects) and shows token usage for the current 5-hour
+block, today, and the last 7 days, plus your plan's real limits when Claude
+Code reports them through the status-line bridge.
 
 The limit per block is learned: choose "Mark Limit Reached" when Claude Code
 tells you you've hit it, and the indicator calibrates from those blocks.
@@ -14,6 +18,7 @@ Usage:
     claude_usage_indicator.py --once          # print stats to terminal
     claude_usage_indicator.py --settings      # open the settings window
     claude_usage_indicator.py --limit 5000000 # override the limit per 5h block
+    claude_usage_indicator.py --version
 """
 import argparse
 import copy
@@ -30,11 +35,23 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-PROJECT_DIRS = [
-    os.path.expanduser("~/.claude/projects"),
-    os.path.expanduser("~/.config/claude/projects"),
-]
+__version__ = "1.0.0"
+APP_NAME = "Usage Meter for Claude Code"
+APP_ID = "io.github.nsypxlmx.UsageMeterForClaudeCode"
+
+
+def project_dirs():
+    """Where Claude Code keeps session logs; CLAUDE_CONFIG_DIR (one folder, or
+    several separated by commas) replaces the default ~/.claude."""
+    roots = [d for d in os.environ.get("CLAUDE_CONFIG_DIR", "").split(",") if d.strip()]
+    roots = roots or ["~/.claude", "~/.config/claude"]
+    return [os.path.join(os.path.expanduser(r.strip()), "projects") for r in roots]
+
+
+PROJECT_DIRS = project_dirs()
 ICON_DIR = os.path.expanduser("~/.cache/claude-usage")
+LOG_PATH = os.path.join(ICON_DIR, "indicator.log")
+LOG_MAX_BYTES = 512 * 1024
 STATE_PATH = os.path.join(ICON_DIR, "state.json")
 # Written by claude_usage_statusline.py with the plan limits Claude Code reports.
 LIMITS_PATH = os.path.join(ICON_DIR, "limits.json")
@@ -55,7 +72,7 @@ COLORS = {
 }
 # Ring color when no limit is set. GNOME names match org.gnome.desktop.interface accent-color.
 ACCENTS = {
-    "claude": ("Claude", "#D97757"),
+    "claude": ("Terracotta", "#D97757"),
     "blue": ("Blue", "#3584E4"),
     "teal": ("Teal", "#2190A4"),
     "green": ("Green", "#3A944A"),
@@ -973,7 +990,7 @@ def due_alerts(stats, limit, settings, state):
             forecast = projection(stats, limit)
             if forecast and forecast.startswith(("Limit likely", "On pace")):
                 body = f"{forecast}. {body}"
-            title = "5-hour limit" if "five_hour" in plan else "Claude usage"
+            title = "5-hour limit" if "five_hour" in plan else "Claude Code usage"
             alerts.append((f"{title} at {pct}%", body))
     weekly = plan.get("seven_day")
     if weekly:
@@ -1016,6 +1033,24 @@ def run_once(override):
         show_rows(rows, "    ")
 
 
+def send_errors_to_log():
+    """When started from autostart there's no terminal; keep errors (including
+    GTK warnings, hence dup2) in a small log the menu can open."""
+    if sys.stderr and sys.stderr.isatty():
+        return
+    os.makedirs(ICON_DIR, exist_ok=True)
+    try:
+        if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+    log = open(LOG_PATH, "a", buffering=1)
+    os.dup2(log.fileno(), 2)
+    sys.stderr = log
+    print(f"--- {APP_NAME} {__version__} started {datetime.now():%Y-%m-%d %H:%M:%S}",
+          file=sys.stderr)
+
+
 def run_indicator(override):
     import subprocess
     import gi
@@ -1029,7 +1064,8 @@ def run_indicator(override):
         from gi.repository import AppIndicator3 as AppIndicator
     from gi.repository import Gtk, GLib, Gio, Notify
 
-    Notify.init("Claude Usage")
+    send_errors_to_log()
+    Notify.init(APP_NAME)
     ind = AppIndicator.Indicator.new(
         "claude-usage", "utilities-system-monitor",
         AppIndicator.IndicatorCategory.APPLICATION_STATUS)
@@ -1108,7 +1144,7 @@ def run_indicator(override):
 
     def step_pulse():
         current["frame"] = (current["frame"] + 1) % PULSE_FRAMES
-        ind.set_icon_full(current_icon(), "Claude usage")
+        ind.set_icon_full(current_icon(), APP_NAME)
         return True
 
     def watch():
@@ -1147,7 +1183,7 @@ def run_indicator(override):
         if current["anim"]:
             GLib.source_remove(current["anim"])
             current["anim"] = None
-            ind.set_icon_full(current_icon(), "Claude usage")
+            ind.set_icon_full(current_icon(), APP_NAME)
 
     # Battery, Power Saver and the lock screen, followed over D-Bus.
     power = {"battery": False, "profile": "", "locked": False, "saving": False}
@@ -1282,11 +1318,26 @@ def run_indicator(override):
                 current["shown"] = shown
                 current["segments"] = segments or None
                 ind.set_label(*(("", "") if segments else (label, guide)))
-                ind.set_icon_full(current_icon(), "Claude usage")
+                ind.set_icon_full(current_icon(), APP_NAME)
                 ind.set_menu(build_menu(stats, limit, content))
-        except Exception as e:  # keep the tray alive on parse errors
-            ind.set_label(" err", "")
-            print("refresh error:", e, file=sys.stderr)
+        except Exception:  # keep the tray alive, and say so instead of going quiet
+            import traceback
+            traceback.print_exc()
+            current["shown"] = None
+            ind.set_label(" !", "")
+            menu = Gtk.Menu()
+            for text, cb in (("Couldn’t Read Claude Code Usage", None),
+                             ("Open Log", lambda _: Gio.AppInfo.launch_default_for_uri(
+                                 "file://" + LOG_PATH, None)),
+                             ("Settings…", open_settings),
+                             ("Quit", lambda _: Gtk.main_quit())):
+                mi = Gtk.MenuItem(label=text)
+                mi.set_sensitive(cb is not None)
+                if cb:
+                    mi.connect("activate", cb)
+                menu.append(mi)
+            menu.show_all()
+            ind.set_menu(menu)
         return True
 
     # Follow the system accent the moment it changes, not at the next refresh.
@@ -1475,15 +1526,23 @@ def run_settings():
 
         custom_row.connect("apply", apply_custom)
 
-        forget_row = Adw.ButtonRow(title="Forget Learned Limit")
-        forget_row.set_sensitive(bool(s["hits"]))
+        # A plain row with a button rather than Adw.ButtonRow, which needs
+        # libadwaita 1.6 (Ubuntu 24.04 ships 1.5).
+        forget_row = Adw.ActionRow(title="Learned Limit",
+                                   subtitle=f"From {min(len(s['hits']), LEARN_FROM)} marked blocks"
+                                   if s["hits"] else "Nothing learned yet")
+        forget_button = Gtk.Button(label="Forget", valign=Gtk.Align.CENTER,
+                                   sensitive=bool(s["hits"]))
+        forget_button.add_css_class("destructive-action")
+        forget_row.add_suffix(forget_button)
 
-        def forget(row):
+        def forget(button):
             update_settings(hits=[])
-            row.set_sensitive(False)
+            button.set_sensitive(False)
+            forget_row.set_subtitle("Nothing learned yet")
             toasts.add_toast(Adw.Toast(title="Learned limit forgotten"))
 
-        forget_row.connect("activated", forget)
+        forget_button.connect("clicked", forget)
 
         alert_options = [(",".join(map(str, levels)), alert_label(levels)) for levels in ALERT_CHOICES]
         limit_groups = [
@@ -1510,11 +1569,11 @@ def run_settings():
         toolbar.add_top_bar(header)
         toasts.set_child(toolbar)
 
-        window = Adw.ApplicationWindow(application=app, title="Claude Usage Settings",
+        window = Adw.ApplicationWindow(application=app, title=f"{APP_NAME} Settings",
                                        default_width=460, default_height=680, content=toasts)
         window.present()
 
-    app = Adw.Application(application_id="io.github.ClaudeUsage.Settings")
+    app = Adw.Application(application_id=APP_ID + ".Settings")
     # A second launch focuses the open window instead of opening another.
     app.connect("activate", lambda a: a.get_active_window().present()
                 if a.get_active_window() else build(a))
@@ -1522,7 +1581,8 @@ def run_settings():
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=f"{APP_NAME}: Claude Code usage in the GNOME top bar.")
+    ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     ap.add_argument("--once", action="store_true", help="print stats and exit")
     ap.add_argument("--settings", action="store_true", help="open the settings window")
     ap.add_argument("--limit", type=int, default=0,
