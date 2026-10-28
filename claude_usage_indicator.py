@@ -35,7 +35,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 APP_NAME = "Usage Meter for Claude Code"
 APP_ID = "io.github.nsypxlmx.UsageMeterForClaudeCode"
 
